@@ -1,0 +1,25 @@
+{
+  "name": "pi-autodevelop-loop",
+  "version": "0.1.0",
+  "description": "Reusable pi package that runs an autonomous develop-test-verify loop around an immutable markdown goal file.",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "agent-skill",
+    "autonomous-coding"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/autodevelop/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  }
+}
