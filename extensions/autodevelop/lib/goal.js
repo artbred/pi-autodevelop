@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
-import { GOAL_SECTION_ORDER } from "./constants.js";
+import { GOAL_SECTION_ORDER, QUALITY_OBJECTIVE_NAMES } from "./constants.js";
 
 function trimSectionLines(lines) {
 	return lines.join("\n").trim();
@@ -14,6 +14,25 @@ function normalizeHeading(text) {
 
 export function sha256Text(text) {
 	return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+export function parseExplicitOptOuts(sectionText) {
+	if (!sectionText?.trim()) return [];
+
+	const supported = new Set(QUALITY_OBJECTIVE_NAMES);
+	const matches = new Set();
+
+	for (const line of sectionText.split(/\r?\n/)) {
+		const bulletMatch = line.match(/^\s*[-*+]\s+(.+?)\s*$/);
+		if (!bulletMatch) continue;
+
+		const candidate = bulletMatch[1].trim().toLowerCase();
+		if (supported.has(candidate)) {
+			matches.add(candidate);
+		}
+	}
+
+	return [...matches];
 }
 
 export function parseGoalDocument(text) {
@@ -54,6 +73,7 @@ export function parseGoalDocument(text) {
 		sections,
 		hasStructuredSections: presentSections.length > 0,
 		presentSections,
+		explicitOptOuts: parseExplicitOptOuts(sections["Explicit Opt-Outs"]),
 	};
 }
 
@@ -74,6 +94,7 @@ export async function readGoalSnapshot(cwd, goalPath) {
 		sections: parsed.sections,
 		presentSections: parsed.presentSections,
 		hasStructuredSections: parsed.hasStructuredSections,
+		explicitOptOuts: parsed.explicitOptOuts,
 		readonlyProtection: false,
 	};
 }
@@ -127,6 +148,11 @@ Describe the final outcome the auto-develop loop must achieve.
 # Notes
 
 - Add context, links, examples, or research hints.
+
+# Explicit Opt-Outs
+
+Leave this section empty unless you intentionally want to disable one of the default hardening objectives.
+Allowed values when needed: \`performance\`, \`latency\`, \`throughput\`, \`memory\`, \`scalability\`, \`reliability\`.
 `;
 }
 

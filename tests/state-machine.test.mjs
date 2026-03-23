@@ -3,8 +3,12 @@ import assert from "node:assert/strict";
 
 import {
 	applyStateAction,
+	allEnabledQualityObjectivesResolved,
 	buildLoopContext,
+	createDefaultQualityObjectives,
 	createInitialLoopState,
+	getUnresolvedQualityObjectives,
+	migrateLoopState,
 	nextRunnablePhase,
 	reconstructStateFromEntries,
 } from "../extensions/autodevelop/lib/state-machine.js";
@@ -17,23 +21,26 @@ function makeGoal() {
 		sections: { Goal: "Ship it." },
 		presentSections: ["Goal"],
 		hasStructuredSections: true,
+		explicitOptOuts: [],
 		readonlyProtection: true,
 	};
 }
 
-test("replace_plan normalizes backlog items and keeps loop planning by default", () => {
+test("replace_plan normalizes backlog items and keeps loop in delivery mode by default", () => {
 	const initial = createInitialLoopState(makeGoal());
 	const next = applyStateAction(initial, "replace_plan", {
 		items: [
-			{ title: "Inspect repo", kind: "research" },
-			{ title: "Implement loop", kind: "code", acceptanceCriteria: "Core command works" },
+			{ title: "Inspect repo", kind: "research", objectiveRefs: ["reliability"] },
+			{ title: "Implement loop", kind: "code", acceptanceCriteria: "Core command works", objectiveRefs: ["scalability"] },
 		],
 	});
 
 	assert.equal(next.backlog.length, 2);
 	assert.ok(next.backlog[0].id.startsWith("item-1-"));
 	assert.equal(next.backlog[1].acceptanceCriteria, "Core command works");
-	assert.equal(next.phase, "planning");
+	assert.deepEqual(next.backlog[0].objectiveRefs, ["reliability"]);
+	assert.equal(next.mode, "delivery");
+	assert.equal(next.phase, "researching");
 });
 
 test("update_item drives the current item and phase", () => {
@@ -55,7 +62,7 @@ test("update_item drives the current item and phase", () => {
 	assert.equal(done.currentItemId, null);
 });
 
-test("block and complete record stop reasons and summaries", () => {
+test("block and complete record stop reasons and switch delivery into hardening", () => {
 	const blocked = applyStateAction(createInitialLoopState(makeGoal()), "block", {
 		reason: "Missing API key",
 	});
@@ -65,10 +72,29 @@ test("block and complete record stop reasons and summaries", () => {
 	const completed = applyStateAction(createInitialLoopState(makeGoal()), "complete", {
 		summary: "All checks passed",
 	});
-	assert.equal(completed.phase, "improving");
+	assert.equal(completed.mode, "hardening");
+	assert.equal(completed.phase, "planning");
 	assert.equal(completed.goalSatisfied, true);
 	assert.equal(completed.lastVerificationSummary, "All checks passed");
 	assert.equal(completed.stopReason, "");
+});
+
+test("update_objective tracks evidence and promotes hardening to improvement when resolved", () => {
+	let state = applyStateAction(createInitialLoopState(makeGoal()), "complete", {
+		summary: "Primary goal satisfied",
+	});
+
+	for (const objective of getUnresolvedQualityObjectives(state)) {
+		state = applyStateAction(state, "update_objective", {
+			objective,
+			status: "addressed",
+			evidence: `Handled ${objective}`,
+		});
+	}
+
+	assert.equal(allEnabledQualityObjectivesResolved(state), true);
+	assert.equal(state.mode, "improvement");
+	assert.equal(state.qualityObjectives.reliability.evidence, "Handled reliability");
 });
 
 test("reconstructs the latest loop state from mixed session entries", () => {
@@ -100,23 +126,70 @@ test("reconstructs the latest loop state from mixed session entries", () => {
 	assert.equal(reconstructed.phase, "implementing");
 });
 
+test("migrates legacy improving state into v2 improvement mode", () => {
+	const migrated = migrateLoopState({
+		version: 1,
+		goal: makeGoal(),
+		phase: "improving",
+		goalSatisfied: true,
+		backlog: [],
+		iteration: 3,
+		currentItemId: null,
+		lastVerificationSummary: "",
+		lastFailure: "",
+		stopReason: "",
+		completionSummary: "done",
+	});
+
+	assert.equal(migrated.version, 2);
+	assert.equal(migrated.mode, "improvement");
+	assert.equal(migrated.phase, "planning");
+	assert.equal(migrated.qualityObjectives.scalability.status, "pending");
+});
+
+test("legacy goalSatisfied state without mode migrates into hardening", () => {
+	const migrated = migrateLoopState({
+		version: 1,
+		goal: makeGoal(),
+		phase: "planning",
+		goalSatisfied: true,
+		backlog: [],
+		iteration: 1,
+		currentItemId: null,
+	});
+
+	assert.equal(migrated.mode, "hardening");
+});
+
 test("builds loop context and computes the next runnable phase", () => {
 	const initial = applyStateAction(createInitialLoopState(makeGoal()), "replace_plan", {
-		items: [{ id: "verify-1", title: "Verify behavior", kind: "verify", status: "pending" }],
+		items: [{ id: "verify-1", title: "Verify behavior", kind: "verify", status: "pending", objectiveRefs: ["reliability"] }],
 	});
 	assert.equal(nextRunnablePhase(initial), "verifying");
 
 	const context = buildLoopContext(initial);
 	assert.match(context, /AUTODEVELOP LOOP ACTIVE/);
 	assert.match(context, /Goal file: \/tmp\/project\/goal.md/);
+	assert.match(context, /Mode: delivery/);
 	assert.match(context, /\[pending\] \[verify\] Verify behavior/);
+	assert.match(context, /chunking, batching, streaming/);
 });
 
-test("nextRunnablePhase stays in improvement mode after the primary goal is satisfied", () => {
-	const improving = applyStateAction(createInitialLoopState(makeGoal()), "complete", {
-		summary: "Primary goal satisfied",
+test("createInitialLoopState enables all quality objectives unless explicitly opted out", () => {
+	const initial = createInitialLoopState({
+		...makeGoal(),
+		explicitOptOuts: ["latency"],
 	});
 
-	assert.equal(nextRunnablePhase(improving), "improving");
-	assert.match(buildLoopContext(improving), /Primary goal satisfied: yes/);
+	assert.equal(initial.mode, "delivery");
+	assert.equal(initial.qualityObjectives.latency.enabled, false);
+	assert.equal(initial.qualityObjectives.latency.status, "opted_out");
+	assert.equal(initial.qualityObjectives.reliability.status, "pending");
+});
+
+test("createDefaultQualityObjectives marks opt-outs precisely", () => {
+	const objectives = createDefaultQualityObjectives(["latency", "memory"]);
+	assert.equal(objectives.latency.status, "opted_out");
+	assert.equal(objectives.memory.enabled, false);
+	assert.equal(objectives.performance.status, "pending");
 });

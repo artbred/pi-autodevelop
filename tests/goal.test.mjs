@@ -25,12 +25,18 @@ Ship the extension.
 # Constraints
 
 - Goal file is immutable
+
+# Explicit Opt-Outs
+
+- latency
+- reliability
 `;
 	const parsed = parseGoalDocument(content);
 	assert.equal(parsed.hasStructuredSections, true);
 	assert.equal(parsed.sections.Goal, "Ship the extension.");
 	assert.match(parsed.sections["Success Criteria"], /Tests pass/);
 	assert.match(parsed.sections.Constraints, /immutable/);
+	assert.deepEqual(parsed.explicitOptOuts, ["latency", "reliability"]);
 });
 
 test("treats plain markdown as unstructured but hashable goal content", () => {
@@ -67,4 +73,18 @@ test("scaffold creates the expected goal template", async () => {
 	assert.match(contents, /^# Goal/m);
 	assert.match(contents, /^# Success Criteria/m);
 	assert.match(contents, /^# Constraints/m);
+	assert.match(contents, /^# Explicit Opt-Outs/m);
+});
+
+test("goal snapshot keeps explicit opt-outs limited to the dedicated section", async () => {
+	const tempDir = await mkdtemp(join(tmpdir(), "autodevelop-optout-"));
+	const goalPath = join(tempDir, "goal.md");
+	await writeFile(
+		goalPath,
+		"# Goal\n\nImprove throughput.\n\n# Notes\n\nMention latency here, but do not opt out.\n\n# Explicit Opt-Outs\n\n- latency\n",
+		"utf8",
+	);
+
+	const snapshot = await readGoalSnapshot(tempDir, "./goal.md");
+	assert.deepEqual(snapshot.explicitOptOuts, ["latency"]);
 });

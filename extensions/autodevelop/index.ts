@@ -1,7 +1,6 @@
-import { complete } from "@mariozechner/pi-ai";
+import { complete, StringEnum } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { convertToLlm, serializeConversation } from "@mariozechner/pi-coding-agent";
-import { StringEnum } from "@mariozechner/pi-ai";
 import { Type } from "@sinclair/typebox";
 import { realpath } from "node:fs/promises";
 import { basename, resolve } from "node:path";
@@ -12,7 +11,9 @@ import {
 	ITEM_STATUSES,
 	LOOP_PHASES,
 	LOOP_SKILL_COMMAND,
-	PAUSED_OR_TERMINAL_PHASES,
+	QUALITY_HARDENING_PRIORITY,
+	QUALITY_OBJECTIVE_NAMES,
+	QUALITY_OBJECTIVE_STATUSES,
 } from "./lib/constants.js";
 import {
 	createGoalScaffoldContent,
@@ -23,10 +24,12 @@ import {
 } from "./lib/goal.js";
 import {
 	applyStateAction,
+	allEnabledQualityObjectivesResolved,
 	buildLoopContext,
 	cloneLoopState,
 	createInitialLoopState,
 	formatLoopStateMarkdown,
+	getUnresolvedQualityObjectives,
 	isLoopRunning,
 	nextRunnablePhase,
 	reconstructStateFromEntries,
@@ -40,6 +43,11 @@ const BacklogItemSchema = Type.Object({
 	status: Type.Optional(StringEnum(ITEM_STATUSES)),
 	notes: Type.Optional(Type.String({ description: "Progress, findings, or constraints." })),
 	acceptanceCriteria: Type.Optional(Type.String({ description: "What proves the item is done." })),
+	objectiveRefs: Type.Optional(
+		Type.Array(StringEnum(QUALITY_OBJECTIVE_NAMES), {
+			description: "Quality objectives advanced by this item, such as scalability or reliability.",
+		}),
+	),
 });
 
 const BacklogItemPatchSchema = Type.Partial(
@@ -49,16 +57,20 @@ const BacklogItemPatchSchema = Type.Partial(
 		status: StringEnum(ITEM_STATUSES),
 		notes: Type.String(),
 		acceptanceCriteria: Type.String(),
+		objectiveRefs: Type.Array(StringEnum(QUALITY_OBJECTIVE_NAMES)),
 	}),
 );
 
 const AutoDevelopStateSchema = Type.Object({
-	action: StringEnum(["get", "replace_plan", "update_item", "set_phase", "block", "complete"]),
+	action: StringEnum(["get", "replace_plan", "update_item", "set_phase", "update_objective", "block", "complete"]),
 	items: Type.Optional(Type.Array(BacklogItemSchema)),
 	itemId: Type.Optional(Type.String()),
 	patch: Type.Optional(BacklogItemPatchSchema),
 	phase: Type.Optional(StringEnum(LOOP_PHASES)),
 	currentItemId: Type.Optional(Type.String()),
+	objective: Type.Optional(StringEnum(QUALITY_OBJECTIVE_NAMES)),
+	status: Type.Optional(StringEnum(QUALITY_OBJECTIVE_STATUSES)),
+	evidence: Type.Optional(Type.String()),
 	reason: Type.Optional(Type.String()),
 	summary: Type.Optional(Type.String()),
 	verificationSummary: Type.Optional(Type.String()),
@@ -69,18 +81,44 @@ function formatShortHash(hash?: string) {
 	return hash ? hash.slice(0, 12) : "unknown";
 }
 
+function hasOpenBacklogItem(state: ReturnType<typeof cloneLoopState>) {
+	return state?.backlog?.some((item) => item.status === "pending" || item.status === "in_progress");
+}
+
+function buildQualityPrompt(state: ReturnType<typeof cloneLoopState>) {
+	const unresolved = getUnresolvedQualityObjectives(state);
+	const unresolvedText = unresolved.length ? unresolved.join(", ") : "none";
+
+	if (!hasOpenBacklogItem(state)) {
+		if (state?.mode === "delivery") {
+			return `The backlog is empty. Replan delivery work so the plan already accounts for unresolved quality objectives: ${unresolvedText}.`;
+		}
+
+		if (state?.mode === "hardening" || state?.mode === "improvement") {
+			return `The backlog is empty. Replan immediately. Prioritize unresolved quality objectives first in this order: ${QUALITY_HARDENING_PRIORITY.join(", ")}. Unresolved: ${unresolvedText}. Only move to broader improvement work after those are responsibly handled or proven not applicable.`;
+		}
+	}
+
+	return `Unresolved quality objectives in priority order: ${unresolvedText}.`;
+}
+
 function buildLoopTurnPrompt(state: ReturnType<typeof cloneLoopState>, reason: string) {
 	const currentItem = state?.backlog.find((item) => item.id === state.currentItemId);
 	const currentItemLine = currentItem ? `Current item: [${currentItem.kind}] ${currentItem.title}` : "Current item: none";
-	const modeInstructions = state?.goalSatisfied
-		? `The primary goal is already satisfied. Stay in improvement mode: keep finding concrete ways to make the system better, broader, more reliable, better tested, more automated, easier to maintain, or better researched. Do not wait for a new task just because the original goal is met.`
-		: `If the primary goal is satisfied, call autodevelop_state with action="complete" to enter improvement mode.`;
+	const modeInstructions =
+		state?.mode === "delivery"
+			? `Stay in delivery mode until the primary goal is satisfied. When it is satisfied, call autodevelop_state with action="complete" to enter hardening mode.`
+			: state?.mode === "hardening"
+				? `You are in hardening mode. Do not treat the loop as done. Resolve enabled quality objectives before drifting into broader improvement work.`
+				: `You are in improvement mode. Keep finding justified ways to make the system better without waiting for a new user task.`;
+
 	return `${LOOP_SKILL_COMMAND} reason=${reason}
 
 Continue the autonomous development loop.
 
 Goal file: ${state?.goal?.path ?? "unknown"}
 Goal hash: ${state?.goal?.hash ?? "unknown"}
+Mode: ${state?.mode ?? "unknown"}
 Phase: ${state?.phase ?? "unknown"}
 Primary goal satisfied: ${state?.goalSatisfied ? "yes" : "no"}
 Iteration: ${state?.iteration ?? 0}
@@ -89,6 +127,9 @@ ${currentItemLine}
 Use autodevelop_state with action="get" first, then proceed with the next best action.
 If the backlog is empty, create one with replace_plan.
 If you are blocked, call autodevelop_state with action="block".
+Use update_objective to record evidence as you address reliability, scalability, throughput, latency, memory efficiency, and performance.
+Inspect large-data and high-load behavior for chunking, batching, streaming, pagination, memory pressure, queue depth, retries, timeouts, idempotency, and backpressure unless explicitly opted out.
+${buildQualityPrompt(state)}
 ${modeInstructions}`;
 }
 
@@ -127,16 +168,19 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 
 		const total = loopState.backlog.length;
 		const done = loopState.backlog.filter((item) => item.status === "done").length;
-		const statusLine = `AD ${loopState.phase} ${done}/${total} goal:${basename(loopState.goal.path)}`;
+		const unresolvedCount = getUnresolvedQualityObjectives(loopState).length;
+		const statusLine = `AD ${loopState.mode}/${loopState.phase} ${done}/${total} q:${unresolvedCount} goal:${basename(loopState.goal.path)}`;
 		ctx.ui.setStatus("autodevelop", statusLine);
 
 		const widgetLines = [
 			`goal ${basename(loopState.goal.path)} hash ${formatShortHash(loopState.goal.hash)}`,
-			`phase ${loopState.phase} iteration ${loopState.iteration}`,
+			`mode ${loopState.mode} phase ${loopState.phase} iteration ${loopState.iteration}`,
+			`unresolved quality ${unresolvedCount}`,
 		];
 		for (const item of loopState.backlog.slice(0, 6)) {
 			const prefix = item.id === loopState.currentItemId ? ">" : "-";
-			widgetLines.push(`${prefix} [${item.status}] [${item.kind}] ${item.title}`);
+			const refs = item.objectiveRefs?.length ? ` -> ${item.objectiveRefs.join(",")}` : "";
+			widgetLines.push(`${prefix} [${item.status}] [${item.kind}] ${item.title}${refs}`);
 		}
 		ctx.ui.setWidget("autodevelop", widgetLines);
 	}
@@ -200,6 +244,9 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 		if (!(await ensureGoalIsUnchanged(ctx))) return;
 
 		loopState = cloneLoopState(loopState);
+		if (loopState.mode === "hardening" && allEnabledQualityObjectivesResolved(loopState)) {
+			loopState.mode = "improvement";
+		}
 		loopState.iteration += 1;
 		persistControlState(`queue:${reason}`);
 		syncToolProfile();
@@ -252,7 +299,7 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 						syncToolProfile();
 						updateLoopUi(ctx);
 						emitLoopMessage(
-							`## AutoDevelop Started\n\n- Goal: \`${goalSnapshot.path}\`\n- Hash: \`${goalSnapshot.hash}\`\n- Read-only protection: ${goalSnapshot.readonlyProtection ? "enabled" : "best effort only"}`,
+							`## AutoDevelop Started\n\n- Goal: \`${goalSnapshot.path}\`\n- Hash: \`${goalSnapshot.hash}\`\n- Read-only protection: ${goalSnapshot.readonlyProtection ? "enabled" : "best effort only"}\n- Default hardening priorities: ${QUALITY_HARDENING_PRIORITY.join(", ")}`,
 						);
 						await queueLoopTurn(ctx, "start");
 					} catch (error) {
@@ -296,7 +343,7 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 					persistControlState("resume");
 					syncToolProfile();
 					updateLoopUi(ctx);
-					emitLoopMessage(`## AutoDevelop Resumed\n\nPhase: \`${nextPhase}\``);
+					emitLoopMessage(`## AutoDevelop Resumed\n\nMode: \`${loopState.mode}\`\n\nPhase: \`${nextPhase}\``);
 					await queueLoopTurn(ctx, "resume");
 					return;
 				}
@@ -328,11 +375,14 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 		name: "autodevelop_state",
 		label: "AutoDevelop State",
 		description:
-			"Manage the autonomous development loop state. Use get before acting, replace_plan to define backlog items, update_item as work progresses, set_phase to match the current work mode, block when stuck, and complete when the goal is satisfied.",
-		promptSnippet: "Inspect and update the autonomous loop state, backlog, phase, and completion status.",
+			"Manage the autonomous development loop state. Use get before acting, replace_plan to define backlog items, update_item as work progresses, set_phase to match the work phase, update_objective to record hardening evidence, block when stuck, and complete when the primary goal is satisfied.",
+		promptSnippet: "Inspect and update the autonomous loop state, mode, backlog, hardening objectives, phase, and completion status.",
 		promptGuidelines: [
 			"Call autodevelop_state with action=get before replacing the plan or claiming completion.",
 			"Keep backlog kinds to research, code, test, or verify.",
+			"Unless the goal file explicitly opts out, treat reliability, scalability, throughput, latency, memory efficiency, and performance as default success dimensions.",
+			"Tag backlog items with objectiveRefs when they advance quality objectives.",
+			"Use update_objective with evidence as you address quality objectives.",
 			"Use block when the loop cannot proceed safely or the goal cannot be met with the current constraints.",
 		],
 		parameters: AutoDevelopStateSchema,
@@ -454,9 +504,11 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 		const summaryPrompt = `You are compacting a pi session that is running an autonomous coding loop.
 
 Preserve the following as first-class data:
+- current mode, phase, and iteration
 - immutable goal path, hash, and snapshot
-- current phase and iteration
-- unfinished backlog items with status and kind
+- explicit opt-outs
+- quality objectives with status and evidence
+- unfinished backlog items with status, kind, and objectiveRefs
 - current item id
 - last verification summary
 - last failure or stop reason
@@ -473,6 +525,7 @@ ${conversationText}
 Write markdown with these sections:
 ## Goal Snapshot
 ## Loop State
+## Quality Objectives
 ## Backlog
 ## Verification
 ## Next Step

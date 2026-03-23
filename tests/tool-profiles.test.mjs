@@ -16,25 +16,25 @@ const allTools = [
 ];
 
 test("planning and verification phases stay read-only but keep research helpers", () => {
-	const planningProfile = buildToolProfile(allTools, { phase: "planning" });
+	const planningProfile = buildToolProfile(allTools, { phase: "planning", mode: "delivery" });
 	assert.deepEqual(planningProfile.sort(), ["autodevelop_state", "bash", "find", "google_search", "grep", "ls", "read"].sort());
 
-	const improvingProfile = buildToolProfile(allTools, { phase: "improving" });
-	assert.equal(improvingProfile.includes("edit"), false);
-	assert.equal(improvingProfile.includes("write"), false);
+	const hardeningProfile = buildToolProfile(allTools, { phase: "planning", mode: "hardening" });
+	assert.equal(hardeningProfile.includes("edit"), false);
+	assert.equal(hardeningProfile.includes("write"), false);
 
-	const verifyingProfile = buildToolProfile(allTools, { phase: "verifying" });
+	const verifyingProfile = buildToolProfile(allTools, { phase: "verifying", mode: "improvement" });
 	assert.equal(verifyingProfile.includes("edit"), false);
 	assert.equal(verifyingProfile.includes("write"), false);
 });
 
 test("implementation phases enable editing tools", () => {
-	const implementationProfile = buildToolProfile(allTools, { phase: "implementing" });
+	const implementationProfile = buildToolProfile(allTools, { phase: "implementing", mode: "hardening" });
 	assert.equal(implementationProfile.includes("edit"), true);
 	assert.equal(implementationProfile.includes("write"), true);
 });
 
-test("paused and terminal phases restore all discovered tools", () => {
-	const pausedProfile = buildToolProfile(allTools, { phase: "paused" });
+test("paused phases restore all discovered tools", () => {
+	const pausedProfile = buildToolProfile(allTools, { phase: "paused", mode: "improvement" });
 	assert.equal(pausedProfile.length, allTools.length);
 });
