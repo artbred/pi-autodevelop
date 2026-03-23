@@ -19,6 +19,10 @@ test("planning and verification phases stay read-only but keep research helpers"
 	const planningProfile = buildToolProfile(allTools, { phase: "planning" });
 	assert.deepEqual(planningProfile.sort(), ["autodevelop_state", "bash", "find", "google_search", "grep", "ls", "read"].sort());
 
+	const improvingProfile = buildToolProfile(allTools, { phase: "improving" });
+	assert.equal(improvingProfile.includes("edit"), false);
+	assert.equal(improvingProfile.includes("write"), false);
+
 	const verifyingProfile = buildToolProfile(allTools, { phase: "verifying" });
 	assert.equal(verifyingProfile.includes("edit"), false);
 	assert.equal(verifyingProfile.includes("write"), false);

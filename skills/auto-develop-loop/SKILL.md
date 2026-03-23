@@ -13,7 +13,8 @@ Use this skill only when the `autodevelop_state` tool is available and the sessi
 4. Prefer repo-local inspection, existing code, and relevant tests first. Use external web tools only if they already exist in the current session.
 5. After each meaningful step, update the active backlog item with `update_item`.
 6. Before closing an implementation cycle, run verification and record a concise verification summary with `set_phase`.
-7. If the goal is satisfied, call `complete`. If the loop cannot proceed safely or correctly, call `block`.
+7. If the primary goal is satisfied, call `complete` once to enter continuous improvement mode. After that, keep generating and executing improvement work instead of waiting for a new task.
 8. Never modify the goal markdown file. Never rewrite or reinterpret the goal as mutable working notes.
+9. In improvement mode, keep looking for justified enhancements: reliability, test coverage, maintainability, automation, observability, performance, developer experience, and useful polish.
 
 See [the protocol reference](references/protocol.md) for the loop contract and action details.

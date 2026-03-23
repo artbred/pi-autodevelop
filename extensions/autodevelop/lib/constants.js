@@ -4,6 +4,7 @@ export const BACKLOG_KINDS = ["research", "code", "test", "verify"];
 export const ITEM_STATUSES = ["pending", "in_progress", "done", "blocked"];
 export const LOOP_PHASES = [
 	"planning",
+	"improving",
 	"researching",
 	"implementing",
 	"testing",
@@ -14,8 +15,8 @@ export const LOOP_PHASES = [
 	"stopped",
 ];
 
-export const ACTIVE_PHASES = new Set(["planning", "researching", "implementing", "testing", "verifying"]);
-export const READ_ONLY_PHASES = new Set(["planning", "researching", "verifying"]);
+export const ACTIVE_PHASES = new Set(["planning", "improving", "researching", "implementing", "testing", "verifying"]);
+export const READ_ONLY_PHASES = new Set(["planning", "improving", "researching", "verifying"]);
 export const EXECUTION_PHASES = new Set(["implementing", "testing"]);
 export const PAUSED_OR_TERMINAL_PHASES = new Set(["paused", "blocked", "complete", "stopped"]);
 

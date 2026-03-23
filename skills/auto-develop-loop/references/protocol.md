@@ -8,8 +8,9 @@
 4. Do the work, then update the item status and notes.
 5. Run tests or verification before marking implementation work done.
 6. Write a concise verification summary before moving on.
-7. End with `complete` only when the goal and success criteria are satisfied.
-8. End with `block` when the next step is unclear, unsafe, impossible, or requires unavailable information.
+7. When the primary goal is satisfied, call `complete` to switch into continuous improvement mode.
+8. In improvement mode, keep producing new backlog items that make the system better instead of waiting for a new user task.
+9. End with `block` only when the next step is unclear, unsafe, impossible, or requires unavailable information.
 
 ## Backlog Rules
 
@@ -71,13 +72,33 @@ Provide a direct reason with the concrete blocker.
 
 ### `complete`
 
-Use this only when:
+Use this when:
 
 - the implementation matches the goal
 - relevant verification is complete
-- no essential backlog work remains
+- the loop should switch from goal-fulfillment into continuous improvement mode
 
-Provide a concise summary of what proves completion.
+Provide a concise summary of what proves the primary goal is satisfied. After that, keep going with new improvement work.
+
+## Improvement Mode
+
+When the primary goal has already been satisfied:
+
+- Do not idle.
+- Do not wait for a new task just because the first objective was met.
+- Create new backlog items that improve the result in concrete ways.
+- Prefer improvements that are testable, defensible, and useful.
+
+Good improvement directions:
+
+- tighter tests or higher confidence
+- refactors that reduce complexity or clarify ownership
+- stronger error handling or recovery
+- better automation and tooling
+- performance or resource improvements
+- documentation that removes ambiguity
+- observability, diagnostics, and debugging improvements
+- user-facing polish that makes the system work better
 
 ## Research Guidance
 
@@ -90,4 +111,4 @@ Provide a concise summary of what proves completion.
 - The goal markdown file is immutable.
 - Do not write loop state into the goal file.
 - Do not silently skip verification for code changes.
-- Do not mark the loop complete while backlog items still represent required work.
+- Do not treat primary-goal completion as a signal to stop working.

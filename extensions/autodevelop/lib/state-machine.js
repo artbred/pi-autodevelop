@@ -56,6 +56,7 @@ export function createInitialLoopState(goalSnapshot) {
 		version: LOOP_STATE_VERSION,
 		goal: clone(goalSnapshot),
 		phase: "planning",
+		goalSatisfied: false,
 		iteration: 0,
 		currentItemId: null,
 		backlog: [],
@@ -107,7 +108,9 @@ export function applyStateAction(state, action, params = {}) {
 			const inProgressItem = nextState.backlog.find((item) => item.status === "in_progress");
 			nextState.currentItemId = inProgressItem?.id ?? nextState.currentItemId ?? null;
 			nextState.stopReason = "";
-			nextState.completionSummary = "";
+			if (!nextState.goalSatisfied) {
+				nextState.completionSummary = "";
+			}
 			if (!ACTIVE_PHASES.has(nextState.phase) || nextState.phase === "planning") {
 				nextState.phase = inProgressItem ? phaseFromKind(inProgressItem.kind) : "planning";
 			}
@@ -187,8 +190,9 @@ export function applyStateAction(state, action, params = {}) {
 
 		case "complete": {
 			const summary = params.summary?.trim() ?? "";
-			nextState.phase = "complete";
-			nextState.stopReason = "Goal complete";
+			nextState.phase = "improving";
+			nextState.goalSatisfied = true;
+			nextState.stopReason = "";
 			nextState.completionSummary = summary;
 			if (summary) {
 				nextState.lastVerificationSummary = summary;
@@ -223,7 +227,7 @@ export function nextRunnablePhase(state) {
 	}
 
 	const nextItem = state.backlog.find((candidate) => candidate.status === "in_progress" || candidate.status === "pending");
-	return nextItem ? phaseFromKind(nextItem.kind) : "planning";
+	return nextItem ? phaseFromKind(nextItem.kind) : state.goalSatisfied ? "improving" : "planning";
 }
 
 export function formatLoopStateMarkdown(state) {
@@ -241,11 +245,13 @@ export function formatLoopStateMarkdown(state) {
 		"",
 		`- Goal: \`${state.goal?.path ?? "unknown"}\``,
 		`- Phase: \`${state.phase}\``,
+		`- Primary goal satisfied: ${state.goalSatisfied ? "yes" : "no"}`,
 		`- Iteration: ${state.iteration}`,
 		`- Current item: ${state.currentItemId ? `\`${state.currentItemId}\`` : "none"}`,
 		`- Goal hash: \`${state.goal?.hash ?? "unknown"}\``,
 	];
 
+	if (state.completionSummary) lines.push(`- Goal completion summary: ${state.completionSummary}`);
 	if (state.lastVerificationSummary) lines.push(`- Last verification: ${state.lastVerificationSummary}`);
 	if (state.lastFailure) lines.push(`- Last failure: ${state.lastFailure}`);
 	if (state.stopReason) lines.push(`- Stop reason: ${state.stopReason}`);
@@ -302,11 +308,12 @@ export function buildLoopContext(state) {
 				.join("\n\n")
 		: state.goal.text.trim();
 
-	return `[AUTODEVELOP LOOP ACTIVE]
+return `[AUTODEVELOP LOOP ACTIVE]
 Goal file: ${state.goal.path}
 Goal hash: ${state.goal.hash}
 Iteration: ${state.iteration}
 Phase: ${state.phase}
+Primary goal satisfied: ${state.goalSatisfied ? "yes" : "no"}
 Current item: ${state.currentItemId ?? "none"}
 
 Immutable goal snapshot:
@@ -325,5 +332,6 @@ Rules:
 - Never modify the goal markdown file.
 - Call autodevelop_state with action="get" before changing the plan or claiming completion.
 - Prefer repo-local inspection and tests first.
+- When the primary goal is satisfied, stay in continuous improvement mode and keep looking for concrete ways to make the system better.
 - External web research is allowed only through tools already available in this session.`;
 }

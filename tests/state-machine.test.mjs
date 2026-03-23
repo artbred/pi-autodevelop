@@ -65,8 +65,10 @@ test("block and complete record stop reasons and summaries", () => {
 	const completed = applyStateAction(createInitialLoopState(makeGoal()), "complete", {
 		summary: "All checks passed",
 	});
-	assert.equal(completed.phase, "complete");
+	assert.equal(completed.phase, "improving");
+	assert.equal(completed.goalSatisfied, true);
 	assert.equal(completed.lastVerificationSummary, "All checks passed");
+	assert.equal(completed.stopReason, "");
 });
 
 test("reconstructs the latest loop state from mixed session entries", () => {
@@ -108,4 +110,13 @@ test("builds loop context and computes the next runnable phase", () => {
 	assert.match(context, /AUTODEVELOP LOOP ACTIVE/);
 	assert.match(context, /Goal file: \/tmp\/project\/goal.md/);
 	assert.match(context, /\[pending\] \[verify\] Verify behavior/);
+});
+
+test("nextRunnablePhase stays in improvement mode after the primary goal is satisfied", () => {
+	const improving = applyStateAction(createInitialLoopState(makeGoal()), "complete", {
+		summary: "Primary goal satisfied",
+	});
+
+	assert.equal(nextRunnablePhase(improving), "improving");
+	assert.match(buildLoopContext(improving), /Primary goal satisfied: yes/);
 });

@@ -72,6 +72,9 @@ function formatShortHash(hash?: string) {
 function buildLoopTurnPrompt(state: ReturnType<typeof cloneLoopState>, reason: string) {
 	const currentItem = state?.backlog.find((item) => item.id === state.currentItemId);
 	const currentItemLine = currentItem ? `Current item: [${currentItem.kind}] ${currentItem.title}` : "Current item: none";
+	const modeInstructions = state?.goalSatisfied
+		? `The primary goal is already satisfied. Stay in improvement mode: keep finding concrete ways to make the system better, broader, more reliable, better tested, more automated, easier to maintain, or better researched. Do not wait for a new task just because the original goal is met.`
+		: `If the primary goal is satisfied, call autodevelop_state with action="complete" to enter improvement mode.`;
 	return `${LOOP_SKILL_COMMAND} reason=${reason}
 
 Continue the autonomous development loop.
@@ -79,13 +82,14 @@ Continue the autonomous development loop.
 Goal file: ${state?.goal?.path ?? "unknown"}
 Goal hash: ${state?.goal?.hash ?? "unknown"}
 Phase: ${state?.phase ?? "unknown"}
+Primary goal satisfied: ${state?.goalSatisfied ? "yes" : "no"}
 Iteration: ${state?.iteration ?? 0}
 ${currentItemLine}
 
 Use autodevelop_state with action="get" first, then proceed with the next best action.
 If the backlog is empty, create one with replace_plan.
 If you are blocked, call autodevelop_state with action="block".
-If the goal is satisfied, call autodevelop_state with action="complete".`;
+${modeInstructions}`;
 }
 
 async function resolveCandidatePath(cwd: string, candidatePath: string) {
