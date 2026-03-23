@@ -1,14 +1,14 @@
-export const LOOP_STATE_VERSION = 2;
+export const LOOP_STATE_VERSION = 4;
 
 export const BACKLOG_KINDS = ["research", "code", "test", "verify"];
 export const ITEM_STATUSES = ["pending", "in_progress", "done", "blocked"];
 
 export const LOOP_MODES = ["delivery", "hardening", "improvement"];
-export const LOOP_PHASES = ["planning", "researching", "implementing", "testing", "verifying", "paused", "blocked", "stopped"];
+export const LOOP_PHASES = ["planning", "researching", "implementing", "testing", "verifying", "reviewing", "paused", "blocked", "stopped"];
 export const LEGACY_LOOP_PHASES = new Set(["improving", "complete"]);
 
-export const ACTIVE_PHASES = new Set(["planning", "researching", "implementing", "testing", "verifying"]);
-export const READ_ONLY_PHASES = new Set(["planning", "researching", "verifying"]);
+export const ACTIVE_PHASES = new Set(["planning", "researching", "implementing", "testing", "verifying", "reviewing"]);
+export const READ_ONLY_PHASES = new Set(["planning", "researching", "verifying", "reviewing"]);
 export const EXECUTION_PHASES = new Set(["implementing", "testing"]);
 export const PAUSED_OR_TERMINAL_PHASES = new Set(["paused", "blocked", "stopped"]);
 
@@ -29,4 +29,19 @@ export const GOAL_SECTION_ORDER = [
 
 export const LOOP_SKILL_COMMAND = "/skill:auto-develop-loop";
 
-export const BUILT_IN_TOOL_NAMES = new Set(["read", "bash", "grep", "find", "ls", "edit", "write"]);
+export const RESEARCH_SCOPES = ["repo", "web", "auto"];
+export const RESEARCH_PROVIDER_NAMES = ["local", "searxng", "pinchtab"];
+export const VERIFICATION_STATUSES = ["pending", "running", "passed", "pass_with_notes", "failed"];
+export const VERIFIER_BACKENDS = ["pi_cli", "inline"];
+
+export const BUILT_IN_TOOL_NAMES = new Set([
+	"read",
+	"bash",
+	"grep",
+	"find",
+	"ls",
+	"edit",
+	"write",
+	"autodevelop_state",
+	"autodevelop_research",
+]);

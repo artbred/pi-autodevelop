@@ -6,20 +6,27 @@
 2. Read the loop `mode`, `qualityObjectives`, and any goal-file opt-outs before planning.
 3. If there is no backlog, create a concrete backlog with `replace_plan`.
 4. Pick a single active item and set the phase that matches its kind.
-5. Do the work, then update the item status and notes.
-6. Update the relevant quality objective with `update_objective` and concrete evidence when you improve or assess it.
-7. Run tests or verification before marking implementation work done.
-8. Write a concise verification summary before moving on.
-9. When the primary goal is satisfied, call `complete` to switch from `delivery` into `hardening`.
-10. In `hardening`, resolve enabled quality objectives before drifting into general improvement work.
-11. In `improvement`, keep producing new backlog items that make the system better instead of waiting for a new user task.
-12. End with `block` only when the next step is unclear, unsafe, impossible, or requires unavailable information.
+5. Use `autodevelop_research` for repo and web research. It is the default research interface and always exists.
+6. If implementation, testing, or verification hits uncertainty, assumptions, unknown behavior, unclear failures, or missing evidence, call `autodevelop_state action="flag_uncertainty"` immediately before continuing.
+7. Do the work, then update the item notes and intermediate status.
+8. When the item satisfies its acceptance criteria, call `request_verification` instead of marking it `done` directly.
+9. Update the relevant quality objective with `update_objective` and concrete evidence when you improve or assess it.
+10. Run tests or verification-oriented checks before requesting verifier approval.
+11. Write a concise verification summary before moving on.
+12. When the primary goal is satisfied, call `complete` to switch from `delivery` into `hardening`.
+13. In `hardening`, resolve enabled quality objectives before drifting into general improvement work.
+14. In `improvement`, keep producing new backlog items that make the system better instead of waiting for a new user task.
+15. End with `block` only when the next step is unclear, unsafe, impossible, or requires unavailable information.
 
 ## Backlog Rules
 
 - Allowed kinds: `research`, `code`, `test`, `verify`
 - Allowed statuses: `pending`, `in_progress`, `done`, `blocked`
 - Use `objectiveRefs` to link backlog items to `performance`, `latency`, `throughput`, `memory`, `scalability`, or `reliability`.
+- Use `evidenceRefs` to cite persisted research artifact ids.
+- Use `dependsOnResearchItemIds` when later work is blocked on specific research items.
+- Set `researchRequired=true` on non-research items that cannot complete until research evidence exists.
+- Every item is verifier-gated by default. Do not plan around skipping verification.
 - Keep titles short and actionable.
 - Prefer several small items over one large item.
 - Use notes for findings, partial results, and blockers.
@@ -76,6 +83,13 @@ Use this after concrete progress. Typical transitions:
 - `in_progress` -> `done`
 - `in_progress` -> `blocked`
 
+Validation rules:
+
+- `research` items require at least one `evidenceRef` before they can be marked `done`
+- `code`, `test`, and `verify` items with `researchRequired=true` require `evidenceRefs` before they can be marked `done`
+- any item with unfinished `dependsOnResearchItemIds` cannot be marked `done`
+- any verifier-gated item requires a passing verifier result before it can be marked `done`
+
 ### `set_phase`
 
 Use this to keep the loop mode aligned with the active work. Also use it to attach:
@@ -96,6 +110,45 @@ Examples:
 - chunking added for large inputs -> `scalability`, `addressed`
 - retries and timeout handling improved -> `reliability`, `addressed`
 - no meaningful latency path exists -> `latency`, `not_applicable`
+
+### `flag_uncertainty`
+
+Use this when code, test, or verify work hits:
+
+- missing evidence
+- ambiguous behavior
+- external dependency unknowns
+- scale or reliability doubts
+- unclear failures
+- assumptions that need proof
+
+Behavior:
+
+- the current non-research item is set back to `pending`
+- that item becomes `researchRequired=true`
+- a linked `research` item is inserted ahead of it
+- the loop switches into `researching`
+
+After the research item is complete, attach its artifact ids through `evidenceRefs` before completing the blocked item.
+
+### `request_verification`
+
+Use this when an item satisfies its acceptance criteria and is ready for an external read-only review.
+
+Validation rules:
+
+- every item must have `acceptanceCriteria`
+- `research` items still require `evidenceRefs`
+- research-blocked items still require `evidenceRefs`
+- direct completion without verifier approval will be rejected
+
+Behavior:
+
+- the item enters verifier review
+- the extension persists a verifier request packet and runs the verifier backend
+- `pass` marks the item done
+- `pass_with_notes` marks the item done and preserves the notes
+- `fail` reopens the item and may insert follow-up research when evidence is missing
 
 ### `block`
 
@@ -158,9 +211,11 @@ Good improvement directions:
 
 ## Research Guidance
 
-- Prefer local source code, configs, tests, and docs.
-- Use existing session tools for web research only when local evidence is insufficient.
-- Do not invent unavailable search tools.
+- Prefer local source code, configs, tests, and docs first.
+- Use `autodevelop_research action="query"` for repo or web research instead of assuming session search tools exist.
+- Use `scope="repo"` for pure local investigation, `scope="auto"` by default, and `scope="web"` only when you explicitly need web-only research.
+- Use `autodevelop_research action="fetch"` to persist files, URLs, or prior artifacts as durable evidence.
+- If no external provider is available, local research still works; do not block the loop just because web research is unavailable.
 
 ## Hard Rules
 
@@ -168,5 +223,7 @@ Good improvement directions:
 - The `# Explicit Opt-Outs` section is the only place that disables a default quality objective.
 - Do not write loop state into the goal file.
 - Do not silently skip verification for code changes.
+- Do not mark an item done directly when it should go through `request_verification`.
 - Do not treat primary-goal completion as a signal to stop working.
 - Do not assume small datasets, low traffic, or ideal conditions unless the goal explicitly constrains the workload that way.
+- Do not continue code, test, or verify work through uncertainty without routing it through `flag_uncertainty` and a dedicated research item.

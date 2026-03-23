@@ -11,14 +11,16 @@ function hasTool(allToolNames, name) {
 }
 
 function getExtraTools(allToolNames) {
-	return allToolNames.filter((name) => !BUILT_IN_TOOL_NAMES.has(name) && name !== "autodevelop_state" && RESEARCH_TOOL_HINT.test(name));
+	return allToolNames.filter((name) => !BUILT_IN_TOOL_NAMES.has(name) && RESEARCH_TOOL_HINT.test(name));
 }
 
 export function buildToolProfile(allTools, loopState) {
 	if (!loopState) return null;
 
 	const allToolNames = allTools.map((tool) => tool.name);
-	const readOnlyBase = ["read", "bash", "grep", "find", "ls", "autodevelop_state"].filter((name) => hasTool(allToolNames, name));
+	const readOnlyBase = ["read", "bash", "grep", "find", "ls", "autodevelop_state", "autodevelop_research"].filter((name) =>
+		hasTool(allToolNames, name),
+	);
 	const executionBase = [...readOnlyBase, "edit", "write"].filter((name) => hasTool(allToolNames, name));
 	const extraTools = getExtraTools(allToolNames);
 
