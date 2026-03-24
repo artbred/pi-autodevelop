@@ -333,12 +333,15 @@ function normalizeVerificationReport(report, index = 0) {
 		throw new Error(`Invalid verification report status: ${status}`);
 	}
 
+	const failureKind = report.failureKind?.trim?.().toLowerCase?.() === "infrastructure" ? "infrastructure" : "task";
+
 	return {
 		id: report.id?.trim() || `verify-report-${index + 1}`,
 		requestId: report.requestId?.trim?.() ?? "",
 		requestFingerprint: report.requestFingerprint?.trim?.() ?? "",
 		createdAt: report.createdAt?.trim?.() ?? "",
 		status,
+		failureKind,
 		summary: report.summary?.trim?.() ?? "",
 		findings: uniqueTrimmed(report.findings),
 		missingEvidence: uniqueTrimmed(report.missingEvidence),
@@ -535,11 +538,22 @@ function ensureCurrentResearchItemUsesArtifact(state, artifactId) {
 
 function buildVerifierNotes(report) {
 	const lines = [];
+	if (report.failureKind === "infrastructure") {
+		lines.push("Verifier infrastructure failed before a review verdict was produced.");
+	}
 	if (report.summary) lines.push(`Verifier summary: ${report.summary}`);
 	if (report.findings?.length) lines.push(`Verifier findings:\n- ${report.findings.join("\n- ")}`);
 	if (report.missingEvidence?.length) lines.push(`Missing evidence:\n- ${report.missingEvidence.join("\n- ")}`);
 	if (report.recommendedNextSteps?.length) lines.push(`Recommended next steps:\n- ${report.recommendedNextSteps.join("\n- ")}`);
 	return lines.join("\n");
+}
+
+function findRunnableBacklogItemExcluding(state, excludedItemId) {
+	return (
+		state?.backlog?.find(
+			(candidate) => candidate.id !== excludedItemId && (candidate.status === "in_progress" || candidate.status === "pending"),
+		) ?? null
+	);
 }
 
 function insertResearchItemForReason(nextState, item, args = {}) {
@@ -793,7 +807,8 @@ export function applyStateAction(state, action, params = {}) {
 			}
 
 			const verifierNotes = buildVerifierNotes(report);
-			item.verificationStatus = verificationStatusFromReport(report.status);
+			item.verificationStatus =
+				report.failureKind === "infrastructure" ? "pending" : verificationStatusFromReport(report.status);
 			item.verificationReportId = report.id;
 			nextState.pendingVerificationItemId = null;
 			nextState.lastVerificationSummary = report.summary || nextState.lastVerificationSummary;
@@ -807,6 +822,25 @@ export function applyStateAction(state, action, params = {}) {
 				nextState.phase = derivePhaseFromState(nextState);
 				nextState.lastFailure = "";
 				nextState.stopReason = "";
+				return normalizeModeAndPhase(nextState);
+			}
+
+			if (report.failureKind === "infrastructure") {
+				if (verifierNotes) {
+					item.notes = appendUniqueText(item.notes, verifierNotes);
+				}
+				item.status = "pending";
+				nextState.lastFailure = report.summary || verifierNotes || "Verifier infrastructure failed.";
+				const alternateItem = findRunnableBacklogItemExcluding(nextState, item.id);
+				if (alternateItem) {
+					nextState.currentItemId = alternateItem.id;
+					nextState.phase = phaseFromKind(alternateItem.kind);
+					nextState.stopReason = "";
+				} else {
+					nextState.currentItemId = item.id;
+					nextState.phase = "blocked";
+					nextState.stopReason = nextState.lastFailure;
+				}
 				return normalizeModeAndPhase(nextState);
 			}
 
@@ -1029,7 +1063,10 @@ export function formatLoopStateMarkdown(state) {
 		: ["- No research artifacts yet."];
 	const recentReports = state.verificationReports?.slice(-3).reverse() ?? [];
 	const reportLines = recentReports.length
-		? recentReports.map((report) => `- \`${report.requestId}\` [${report.status}] ${report.summary || "No summary."}`)
+		? recentReports.map((report) => {
+				const kindSuffix = report.failureKind === "infrastructure" ? " infra" : "";
+				return `- \`${report.requestId}\` [${report.status}${kindSuffix}] ${report.summary || "No summary."}`;
+			})
 		: ["- No verification reports yet."];
 	const verifier = state.verifierBackend ?? createDefaultVerifierBackend();
 	const verifierStatus = verifier.available
@@ -1225,7 +1262,10 @@ export function buildLoopContext(state) {
 		? state.verificationReports
 				.slice(-3)
 				.reverse()
-				.map((report) => `- \`${report.requestId}\` [${report.status}] ${report.summary || "No summary."}`)
+				.map((report) => {
+					const kindSuffix = report.failureKind === "infrastructure" ? " infra" : "";
+					return `- \`${report.requestId}\` [${report.status}${kindSuffix}] ${report.summary || "No summary."}`;
+				})
 		: ["- None yet."];
 
 	const unresolvedObjectives = getUnresolvedQualityObjectives(state);

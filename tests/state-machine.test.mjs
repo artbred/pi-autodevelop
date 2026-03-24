@@ -486,6 +486,105 @@ test("failed verification reopens the item and inserts research when evidence is
 	assert.match(state.backlog[1].notes, /Large-input evidence is missing/);
 });
 
+test("infrastructure verification failure blocks the loop without reopening implementation as a task failure", () => {
+	let state = applyStateAction(createInitialLoopState(makeGoal()), "replace_plan", {
+		items: [{ id: "code-1", title: "Implement loop", kind: "code", status: "in_progress", acceptanceCriteria: "Command works" }],
+	});
+
+	state = applyStateAction(state, "request_verification", { itemId: "code-1", requestId: "verify-1" });
+	state = applyStateAction(state, "record_verification_request", {
+		request: {
+			id: "verify-1",
+			itemId: "code-1",
+			itemKind: "code",
+			itemTitle: "Implement loop",
+			item: {
+				id: "code-1",
+				kind: "code",
+				title: "Implement loop",
+				status: "in_progress",
+				notes: "",
+				acceptanceCriteria: "Command works",
+				objectiveRefs: [],
+				evidenceRefs: [],
+				dependsOnResearchItemIds: [],
+			},
+			fingerprint: "fp-1",
+		},
+	});
+	state = applyStateAction(state, "apply_verification_report", {
+		report: {
+			id: "report-1",
+			requestId: "verify-1",
+			requestFingerprint: "fp-1",
+			status: "fail",
+			failureKind: "infrastructure",
+			summary: "Verifier backend failed while reviewing \"Implement loop\": Timed out after 120000ms",
+			findings: ["Timed out after 120000ms"],
+			missingEvidence: [],
+			recommendedNextSteps: ["Increase AUTODEVELOP_VERIFIER_TIMEOUT_MS or reduce verifier load."],
+		},
+	});
+
+	assert.equal(state.phase, "blocked");
+	assert.equal(state.stopReason, "Verifier backend failed while reviewing \"Implement loop\": Timed out after 120000ms");
+	assert.equal(state.currentItemId, "code-1");
+	assert.equal(state.pendingVerificationItemId, null);
+	assert.equal(state.backlog[0].status, "pending");
+	assert.equal(state.backlog[0].verificationStatus, "pending");
+	assert.match(state.backlog[0].notes, /Verifier infrastructure failed before a review verdict was produced/);
+});
+
+test("infrastructure verification failure yields to other runnable backlog items", () => {
+	let state = applyStateAction(createInitialLoopState(makeGoal()), "replace_plan", {
+		items: [
+			{ id: "code-1", title: "Implement loop", kind: "code", status: "in_progress", acceptanceCriteria: "Command works" },
+			{ id: "test-1", title: "Add coverage", kind: "test", status: "pending", acceptanceCriteria: "Tests cover the loop" },
+		],
+	});
+
+	state = applyStateAction(state, "request_verification", { itemId: "code-1", requestId: "verify-1" });
+	state = applyStateAction(state, "record_verification_request", {
+		request: {
+			id: "verify-1",
+			itemId: "code-1",
+			itemKind: "code",
+			itemTitle: "Implement loop",
+			item: {
+				id: "code-1",
+				kind: "code",
+				title: "Implement loop",
+				status: "in_progress",
+				notes: "",
+				acceptanceCriteria: "Command works",
+				objectiveRefs: [],
+				evidenceRefs: [],
+				dependsOnResearchItemIds: [],
+			},
+			fingerprint: "fp-1",
+		},
+	});
+	state = applyStateAction(state, "apply_verification_report", {
+		report: {
+			id: "report-1",
+			requestId: "verify-1",
+			requestFingerprint: "fp-1",
+			status: "fail",
+			failureKind: "infrastructure",
+			summary: "Verifier backend failed while reviewing \"Implement loop\": command not found: pi",
+			findings: ["command not found: pi"],
+			missingEvidence: [],
+			recommendedNextSteps: ["Install `pi` or set AUTODEVELOP_VERIFIER_PI_COMMAND to the correct executable."],
+		},
+	});
+
+	assert.equal(state.phase, "testing");
+	assert.equal(state.stopReason, "");
+	assert.equal(state.currentItemId, "test-1");
+	assert.equal(state.backlog[0].status, "pending");
+	assert.equal(state.backlog[0].verificationStatus, "pending");
+});
+
 test("record_research_artifact attaches evidence to the active research item", () => {
 	const initial = applyStateAction(createInitialLoopState(makeGoal()), "replace_plan", {
 		items: [{ id: "research-1", title: "Inspect repo", kind: "research", status: "in_progress" }],

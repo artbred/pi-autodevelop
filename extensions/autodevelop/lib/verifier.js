@@ -489,6 +489,7 @@ export async function runInlineVerifier({
 			requestFingerprint: request.fingerprint,
 			createdAt: new Date().toISOString(),
 			status: "fail",
+			failureKind: "infrastructure",
 			summary: "Inline verifier is unavailable because no model or API key is active.",
 			findings: ["Verifier could not run because the extension has no active model/api key for inline review."],
 			missingEvidence: [],

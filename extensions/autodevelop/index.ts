@@ -158,22 +158,66 @@ function formatVerifierSummary(state: ReturnType<typeof cloneLoopState>) {
 	return `${backend.resolved}:healthy`;
 }
 
+function truncateSingleLine(value: string, max = 160) {
+	const compact = value.replace(/\s+/g, " ").trim();
+	if (compact.length <= max) return compact;
+	return `${compact.slice(0, Math.max(0, max - 3)).trimEnd()}...`;
+}
+
+function uniqueStrings(values: string[]) {
+	return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
+}
+
+function buildVerifierRecoverySteps(message: string) {
+	const normalized = message.toLowerCase();
+	const steps = [];
+
+	if (normalized.includes("timed out after")) {
+		steps.push("Increase AUTODEVELOP_VERIFIER_TIMEOUT_MS or reduce verifier load.");
+	}
+	if (
+		normalized.includes("command not found")
+		|| normalized.includes("not found")
+		|| normalized.includes("no such file")
+	) {
+		steps.push("Install `pi` or set AUTODEVELOP_VERIFIER_PI_COMMAND to the correct executable.");
+	}
+	if (normalized.includes("api key") || normalized.includes("active model")) {
+		steps.push("Enable an inline verifier model/API key before retrying verification.");
+	}
+
+	steps.push("Run `/autodevelop resume` after the verifier backend is healthy.");
+	return uniqueStrings(steps);
+}
+
+function formatVerificationReportStatus(report: { status: string; failureKind?: string }) {
+	return report.failureKind === "infrastructure" ? `${report.status}/infra` : report.status;
+}
+
 function createRequestId(prefix: string, itemId: string) {
 	return `${prefix}-${Date.now()}-${itemId.replace(/[^a-z0-9_-]+/gi, "-").slice(0, 40)}`;
 }
 
-function createVerifierFailureReport(request: { id: string; fingerprint: string }, summary: string, findings: string[] = []) {
+function createVerifierFailureReport(
+	request: { id: string; fingerprint: string },
+	summary: string,
+	findings: string[] = [],
+	options: { failureKind?: "task" | "infrastructure"; recommendedNextSteps?: string[]; rawText?: string } = {},
+) {
 	return {
 		id: `report-${request.id}`,
 		requestId: request.id,
 		requestFingerprint: request.fingerprint,
 		createdAt: new Date().toISOString(),
 		status: "fail" as const,
+		failureKind: options.failureKind ?? "task",
 		summary,
 		findings,
 		missingEvidence: [],
-		recommendedNextSteps: ["Address the verifier findings, then request verification again."],
-		rawText: "",
+		recommendedNextSteps: options.recommendedNextSteps?.length
+			? options.recommendedNextSteps
+			: ["Address the verifier findings, then request verification again."],
+		rawText: options.rawText ?? "",
 	};
 }
 
@@ -319,8 +363,16 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 			`providers ${formatProviderSummary(loopState)}`,
 			`verifier ${formatVerifierSummary(loopState)}`,
 		];
+		if (loopState.verifierBackend?.degradedReason) {
+			widgetLines.push(`verifier detail ${truncateSingleLine(loopState.verifierBackend.degradedReason)}`);
+		}
 		if (latestReport) {
-			widgetLines.push(`last verifier [${latestReport.status}] ${latestReport.summary || "No summary"}`);
+			widgetLines.push(`last verifier [${formatVerificationReportStatus(latestReport)}] ${latestReport.summary || "No summary"}`);
+			if (latestReport.failureKind === "infrastructure" && latestReport.recommendedNextSteps?.length) {
+				widgetLines.push(`next action ${truncateSingleLine(latestReport.recommendedNextSteps[0])}`);
+			}
+		} else if (loopState.verifierBackend?.degradedReason) {
+			widgetLines.push("next action Fix the verifier backend, then run `/autodevelop resume`.");
 		}
 		for (const item of loopState.backlog.slice(0, 6)) {
 			const prefix = item.id === loopState.currentItemId ? ">" : "-";
@@ -655,8 +707,13 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 							});
 							report = createVerifierFailureReport(
 								request,
-								`Verifier backend failed while reviewing "${request.itemTitle}".`,
+								`Verifier backend failed while reviewing "${request.itemTitle}": ${truncateSingleLine(message)}`,
 								[message],
+								{
+									failureKind: "infrastructure",
+									recommendedNextSteps: buildVerifierRecoverySteps(message),
+									rawText: message,
+								},
 							);
 						}
 

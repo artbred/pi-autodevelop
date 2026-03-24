@@ -200,3 +200,31 @@ test("runVerifierWithFallback degrades to inline review when pi_cli fails", asyn
 	assert.match(result.report.summary, /inline fallback/i);
 	assert.match(result.report.findings[0], /pi_cli verifier failed/i);
 });
+
+test("runVerifierWithFallback marks inline verifier unavailability as infrastructure failure", async () => {
+	const request = {
+		id: "verify-1",
+		fingerprint: "fp-1",
+		itemTitle: "Validate pipeline correctness",
+	};
+	const backend = {
+		configured: "inline",
+		resolved: "inline",
+		available: true,
+		degradedReason: null,
+		repoRoot: "/tmp/repo",
+		isGitRepo: true,
+	};
+
+	const result = await runVerifierWithFallback({
+		request,
+		backend,
+		model: null,
+		apiKey: null,
+		completeFn: null,
+	});
+
+	assert.equal(result.report.status, "fail");
+	assert.equal(result.report.failureKind, "infrastructure");
+	assert.match(result.report.summary, /Inline verifier is unavailable/i);
+});
