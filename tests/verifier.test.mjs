@@ -10,6 +10,7 @@ import {
 	isVerificationReportStale,
 	parseVerificationResultText,
 	resolveVerifierBackend,
+	runVerifierWithFallback,
 } from "../extensions/autodevelop/lib/verifier.js";
 
 function normalizePathForAssert(path) {
@@ -148,4 +149,54 @@ test("isVerificationReportStale detects when the item contract changed", async (
 		),
 	};
 	assert.equal(isVerificationReportStale(request, mutated), true);
+});
+
+test("runVerifierWithFallback degrades to inline review when pi_cli fails", async () => {
+	const request = {
+		id: "verify-1",
+		fingerprint: "fp-1",
+		itemTitle: "Validate pipeline correctness",
+	};
+	const backend = {
+		configured: "auto",
+		resolved: "pi_cli",
+		available: true,
+		degradedReason: null,
+		repoRoot: "/tmp/repo",
+		isGitRepo: true,
+	};
+
+	const result = await runVerifierWithFallback({
+		request,
+		backend,
+		paths: {
+			sessionsDir: "/tmp/sessions",
+			worktreesDir: "/tmp/worktrees",
+		},
+		model: "gpt-test",
+		apiKey: "test-key",
+		completeFn: async () => ({ content: [] }),
+		runPiCliVerifierFn: async () => {
+			throw new Error("Verifier backend crashed");
+		},
+		runInlineVerifierFn: async () => ({
+			id: "report-verify-1",
+			requestId: "verify-1",
+			requestFingerprint: "fp-1",
+			createdAt: new Date().toISOString(),
+			status: "pass",
+			summary: "Inline review passed",
+			findings: [],
+			missingEvidence: [],
+			recommendedNextSteps: [],
+			rawText: "",
+		}),
+	});
+
+	assert.equal(result.report.status, "pass");
+	assert.equal(result.fallbackUsed, true);
+	assert.equal(result.backend.resolved, "inline");
+	assert.match(result.backend.degradedReason, /Verifier backend crashed/);
+	assert.match(result.report.summary, /inline fallback/i);
+	assert.match(result.report.findings[0], /pi_cli verifier failed/i);
 });

@@ -382,6 +382,10 @@ function derivePhaseFromState(state) {
 	return nextItem ? phaseFromKind(nextItem.kind) : "planning";
 }
 
+function hasRunnableBacklogItem(state) {
+	return state?.backlog?.some((candidate) => candidate.status === "in_progress" || candidate.status === "pending");
+}
+
 function normalizeModeAndPhase(state) {
 	const nextState = cloneLoopState(state);
 
@@ -916,14 +920,29 @@ export function applyStateAction(state, action, params = {}) {
 				throw new Error("reason is required for block");
 			}
 
-			nextState.phase = "blocked";
-			nextState.stopReason = reason;
 			nextState.lastFailure = reason;
-			if (nextState.currentItemId) {
-				const item = nextState.backlog.find((candidate) => candidate.id === nextState.currentItemId);
-				if (item) item.status = "blocked";
+			const targetItemId = params.itemId?.trim?.() || nextState.currentItemId;
+			if (targetItemId) {
+				const item = nextState.backlog.find((candidate) => candidate.id === targetItemId);
+				if (item) {
+					item.status = "blocked";
+					item.notes = appendUniqueText(item.notes, `Blocked: ${reason}`);
+				}
+				if (nextState.currentItemId === targetItemId) {
+					nextState.currentItemId = null;
+				}
+				if (nextState.pendingVerificationItemId === targetItemId) {
+					nextState.pendingVerificationItemId = null;
+				}
 			}
-			nextState.pendingVerificationItemId = null;
+
+			if (hasRunnableBacklogItem(nextState)) {
+				nextState.phase = derivePhaseFromState(nextState);
+				nextState.stopReason = "";
+			} else {
+				nextState.phase = "blocked";
+				nextState.stopReason = reason;
+			}
 			return normalizeModeAndPhase(nextState);
 		}
 
@@ -1270,6 +1289,7 @@ Rules:
 - Research items must gather evidenceRefs before they can be completed. Any non-research item marked research-required must cite evidenceRefs before it can be completed.
 - Every backlog item is verifier-gated. Never mark an item done directly until you have requested verification and received a passing result.
 - Use autodevelop_state with action="request_verification" when an item satisfies its acceptanceCriteria. The verifier is read-only and may reopen the task if evidence is insufficient.
+- Use autodevelop_state with action="block" only for whole-loop blockers. If one backlog item is blocked but other runnable work remains, keep the loop moving.
 - When backlog is empty in delivery mode, replan while accounting for unresolved quality objectives from the start.
 - When backlog is empty in hardening or improvement mode, prioritize unresolved quality objectives in this order: ${QUALITY_HARDENING_PRIORITY.join(", ")}.
 - For large-data and high-load systems, inspect chunking, batching, streaming, pagination, memory pressure, queue depth, retries, timeouts, idempotency, and backpressure unless explicitly opted out.

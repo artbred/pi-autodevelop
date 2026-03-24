@@ -47,8 +47,7 @@ import {
 	persistVerificationReport,
 	persistVerificationRequest,
 	resolveVerifierBackend,
-	runInlineVerifier,
-	runPiCliVerifier,
+	runVerifierWithFallback,
 } from "./lib/verifier.js";
 
 const BacklogItemSchema = Type.Object({
@@ -226,7 +225,7 @@ Use autodevelop_research as the default research interface for repo and web rese
 If you hit uncertainty, unknown behavior, assumptions, or missing evidence during code/test/verify work, call autodevelop_state with action="flag_uncertainty" immediately and continue through a dedicated research item.
 Every backlog item is verifier-gated. When an item satisfies its acceptanceCriteria, call autodevelop_state with action="request_verification" instead of marking it done directly.
 If the backlog is empty, create one with replace_plan.
-If you are blocked, call autodevelop_state with action="block".
+Use autodevelop_state with action="block" only when the entire loop cannot proceed safely. If only one backlog item is blocked and other work remains, mark that item blocked and continue with the next runnable work.
 Use update_objective to record evidence as you address reliability, scalability, throughput, latency, memory efficiency, and performance.
 Inspect large-data and high-load behavior for chunking, batching, streaming, pagination, memory pressure, queue depth, retries, timeouts, idempotency, and backpressure unless explicitly opted out.
 ${buildQualityPrompt(state)}
@@ -591,7 +590,7 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 			"Every backlog item is verifier-gated. When an item satisfies its acceptanceCriteria, use request_verification instead of marking it done directly.",
 			"Tag backlog items with objectiveRefs and attach evidenceRefs when research unblocks later work.",
 			"Use update_objective with evidence as you address quality objectives.",
-			"Use block when the loop cannot proceed safely or the goal cannot be met with the current constraints.",
+			"Use block only when the entire loop cannot proceed safely or the goal cannot be met with the current constraints. If a single item is blocked but other work remains, block that item and continue.",
 		],
 		parameters: AutoDevelopStateSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -630,24 +629,30 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 
 						let report;
 						try {
-							if (loopState.verifierBackend.resolved === "pi_cli") {
-								report = await runPiCliVerifier({
-									request,
-									backend: loopState.verifierBackend,
-									paths,
-								});
-							} else {
-								const apiKey = ctx.model ? await ctx.modelRegistry.getApiKey(ctx.model) : null;
-								report = await runInlineVerifier({
-									request,
-									model: ctx.model,
-									apiKey,
-									signal,
-									completeFn: complete,
+							const apiKey = ctx.model ? await ctx.modelRegistry.getApiKey(ctx.model) : null;
+							const verification = await runVerifierWithFallback({
+								request,
+								backend: loopState.verifierBackend,
+								paths,
+								model: ctx.model,
+								apiKey,
+								signal,
+								completeFn: complete,
+							});
+							report = verification.report;
+							if (verification.backend && verification.backend !== loopState.verifierBackend) {
+								loopState = applyStateAction(loopState, "sync_verifier_backend", {
+									backend: verification.backend,
 								});
 							}
 						} catch (error) {
 							const message = error instanceof Error ? error.message : String(error);
+							loopState = applyStateAction(loopState, "sync_verifier_backend", {
+								backend: {
+									...loopState.verifierBackend,
+									degradedReason: message,
+								},
+							});
 							report = createVerifierFailureReport(
 								request,
 								`Verifier backend failed while reviewing "${request.itemTitle}".`,

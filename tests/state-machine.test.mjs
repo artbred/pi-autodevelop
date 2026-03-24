@@ -10,6 +10,7 @@ import {
 	createInitialLoopState,
 	formatLoopStateMarkdown,
 	getUnresolvedQualityObjectives,
+	isLoopRunning,
 	migrateLoopState,
 	nextRunnablePhase,
 	reconstructStateFromEntries,
@@ -80,6 +81,38 @@ test("block and complete record stop reasons and switch delivery into hardening"
 	assert.equal(completed.goalSatisfied, true);
 	assert.equal(completed.lastVerificationSummary, "All checks passed");
 	assert.equal(completed.stopReason, "");
+});
+
+test("block only stops the active item when other backlog work remains", () => {
+	const initial = applyStateAction(createInitialLoopState(makeGoal()), "replace_plan", {
+		items: [
+			{
+				id: "test-1",
+				title: "Validate bounded resource behavior",
+				kind: "test",
+				status: "in_progress",
+				acceptanceCriteria: "Tests pass under representative load",
+			},
+			{
+				id: "research-1",
+				title: "Assess verifier fallback options",
+				kind: "research",
+				status: "pending",
+				acceptanceCriteria: "Capture evidenceRefs for the fallback path",
+			},
+		],
+	});
+
+	const next = applyStateAction(initial, "block", {
+		reason: "Representative live-load CPU environment is unavailable.",
+	});
+
+	assert.equal(next.backlog[0].status, "blocked");
+	assert.match(next.backlog[0].notes, /Representative live-load CPU environment is unavailable/);
+	assert.equal(next.phase, "researching");
+	assert.equal(next.stopReason, "");
+	assert.equal(next.lastFailure, "Representative live-load CPU environment is unavailable.");
+	assert.equal(isLoopRunning(next), true);
 });
 
 test("update_objective tracks evidence and promotes hardening to improvement when resolved", () => {

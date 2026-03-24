@@ -16,7 +16,7 @@
 12. When the primary goal is satisfied, call `complete` to switch from `delivery` into `hardening`.
 13. In `hardening`, resolve enabled quality objectives before drifting into general improvement work.
 14. In `improvement`, keep producing new backlog items that make the system better instead of waiting for a new user task.
-15. End with `block` only when the next step is unclear, unsafe, impossible, or requires unavailable information.
+15. End with `block` only when the entire loop is unclear, unsafe, impossible, or requires unavailable information. If one backlog item is blocked but other work remains, keep the loop running.
 
 ## Backlog Rules
 
@@ -160,6 +160,12 @@ Use this when:
 - the immutable goal file changed unexpectedly
 
 Provide a direct reason with the concrete blocker.
+
+Behavior:
+
+- the targeted item is marked `blocked`
+- if other runnable backlog items remain, the loop continues with the next best work
+- the loop enters phase `blocked` only when no runnable work remains
 
 ### `complete`
 

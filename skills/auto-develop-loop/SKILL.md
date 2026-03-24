@@ -24,7 +24,8 @@ Use this skill only when the `autodevelop_state` tool is available and the sessi
 15. If the primary goal is satisfied, call `complete` once to enter hardening mode. Do not treat that as the end of the loop.
 16. In hardening mode, prioritize `reliability`, then `scalability`, `throughput`, `latency`, `memory`, and `performance`.
 17. In improvement mode, continue with justified enhancements such as observability, automation, maintainability, and polish, while still respecting unresolved hardening objectives.
-18. For large-data and high-load systems, inspect chunking, batching, streaming, pagination, memory pressure, queue depth, retries, timeouts, idempotency, and backpressure unless explicitly opted out.
-19. Never modify the goal markdown file. Never rewrite or reinterpret the goal as mutable working notes.
+18. Use `block` only when the entire loop cannot proceed safely. If only one backlog item is blocked and other work remains, keep the loop moving instead of stopping everything.
+19. For large-data and high-load systems, inspect chunking, batching, streaming, pagination, memory pressure, queue depth, retries, timeouts, idempotency, and backpressure unless explicitly opted out.
+20. Never modify the goal markdown file. Never rewrite or reinterpret the goal as mutable working notes.
 
 See [the protocol reference](references/protocol.md) for the loop contract and action details.

@@ -523,6 +523,91 @@ export async function runInlineVerifier({
 	return parseVerificationResultText(text, request);
 }
 
+function annotateFallbackReport(report, backendFailure) {
+	const findings = unique([`pi_cli verifier failed: ${backendFailure}`, ...(report.findings ?? [])]);
+	const recommendedNextSteps = unique([
+		...(report.recommendedNextSteps ?? []),
+		"Investigate the pi_cli verifier backend failure if you want external verifier reviews to resume.",
+	]);
+	const summaryPrefix = "pi_cli verifier failed; inline fallback";
+	return {
+		...report,
+		summary: report.summary ? `${summaryPrefix}: ${report.summary}` : `${summaryPrefix} completed.`,
+		findings,
+		recommendedNextSteps,
+	};
+}
+
+export async function runVerifierWithFallback({
+	request,
+	backend,
+	paths,
+	env = process.env,
+	model,
+	apiKey,
+	signal,
+	completeFn,
+	runPiCliVerifierFn = runPiCliVerifier,
+	runInlineVerifierFn = runInlineVerifier,
+} = {}) {
+	if (backend?.resolved !== "pi_cli") {
+		return {
+			report: await runInlineVerifierFn({
+				request,
+				model,
+				apiKey,
+				signal,
+				completeFn,
+			}),
+			backend,
+			fallbackUsed: false,
+			backendFailure: null,
+		};
+	}
+
+	try {
+		return {
+			report: await runPiCliVerifierFn({
+				request,
+				backend,
+				paths,
+				env,
+			}),
+			backend,
+			fallbackUsed: false,
+			backendFailure: null,
+		};
+	} catch (error) {
+		const backendFailure = error instanceof Error ? error.message : String(error);
+		if (!model || !apiKey || !completeFn) {
+			throw error;
+		}
+
+		try {
+			const report = await runInlineVerifierFn({
+				request,
+				model,
+				apiKey,
+				signal,
+				completeFn,
+			});
+			return {
+				report: annotateFallbackReport(report, backendFailure),
+				backend: {
+					...backend,
+					resolved: "inline",
+					degradedReason: `pi_cli verifier failed for the latest review: ${backendFailure}`,
+				},
+				fallbackUsed: true,
+				backendFailure,
+			};
+		} catch (fallbackError) {
+			const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+			throw new Error(`pi_cli verifier failed: ${backendFailure}; inline fallback failed: ${fallbackMessage}`);
+		}
+	}
+}
+
 export async function runPiCliVerifier({
 	request,
 	backend,
