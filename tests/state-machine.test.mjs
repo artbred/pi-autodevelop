@@ -166,6 +166,30 @@ test("legacy goalSatisfied state without mode migrates into hardening", () => {
 	assert.equal(migrated.mode, "hardening");
 });
 
+test("migrateLoopState preserves a healthy pi_cli verifier backend without inventing degradation", () => {
+	const migrated = migrateLoopState({
+		version: 4,
+		goal: makeGoal(),
+		mode: "delivery",
+		phase: "planning",
+		goalSatisfied: false,
+		backlog: [],
+		iteration: 1,
+		currentItemId: null,
+		verifierBackend: {
+			configured: "auto",
+			resolved: "pi_cli",
+			available: true,
+			degradedReason: null,
+			repoRoot: "/tmp/project",
+			isGitRepo: true,
+		},
+	});
+
+	assert.equal(migrated.verifierBackend.resolved, "pi_cli");
+	assert.equal(migrated.verifierBackend.degradedReason, "");
+});
+
 test("builds loop context and computes the next runnable phase", () => {
 	const initial = applyStateAction(createInitialLoopState(makeGoal()), "replace_plan", {
 		items: [{ id: "verify-1", title: "Verify behavior", kind: "verify", status: "pending", objectiveRefs: ["reliability"] }],

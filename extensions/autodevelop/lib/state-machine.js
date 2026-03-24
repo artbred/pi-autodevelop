@@ -241,11 +241,15 @@ export function createDefaultVerifierBackend() {
 
 function normalizeVerifierBackend(rawBackend) {
 	const defaults = createDefaultVerifierBackend();
+	const degradedReason =
+		rawBackend && Object.prototype.hasOwnProperty.call(rawBackend, "degradedReason")
+			? rawBackend.degradedReason?.trim?.() ?? ""
+			: defaults.degradedReason;
 	const normalized = {
 		configured: rawBackend?.configured?.trim?.() || defaults.configured,
 		resolved: rawBackend?.resolved?.trim?.() || defaults.resolved,
 		available: Boolean(rawBackend?.available ?? defaults.available),
-		degradedReason: rawBackend?.degradedReason?.trim?.() ?? defaults.degradedReason,
+		degradedReason,
 		repoRoot: rawBackend?.repoRoot?.trim?.() ?? defaults.repoRoot,
 		isGitRepo: Boolean(rawBackend?.isGitRepo ?? defaults.isGitRepo),
 	};
