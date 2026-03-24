@@ -16,35 +16,39 @@ const allTools = [
 	{ name: "google_search" },
 ];
 
-test("planning and verification phases stay read-only but keep research helpers", () => {
-	const planningProfile = buildToolProfile(allTools, { phase: "planning", mode: "delivery" });
+test("planning, researching, committing, and relaunching stay read-only but keep research helpers", () => {
+	const planningProfile = buildToolProfile(allTools, { phase: "planning", mode: "cycle" });
 	assert.deepEqual(
 		planningProfile.sort(),
 		["autodevelop_research", "autodevelop_state", "bash", "find", "google_search", "grep", "ls", "read"].sort(),
 	);
 
-	const hardeningProfile = buildToolProfile(allTools, { phase: "planning", mode: "hardening" });
-	assert.equal(hardeningProfile.includes("edit"), false);
-	assert.equal(hardeningProfile.includes("write"), false);
+	const researchingProfile = buildToolProfile(allTools, { phase: "researching", mode: "cycle" });
+	assert.equal(researchingProfile.includes("edit"), false);
+	assert.equal(researchingProfile.includes("write"), false);
 
-	const verifyingProfile = buildToolProfile(allTools, { phase: "verifying", mode: "improvement" });
-	assert.equal(verifyingProfile.includes("edit"), false);
-	assert.equal(verifyingProfile.includes("write"), false);
+	const committingProfile = buildToolProfile(allTools, { phase: "committing", mode: "cycle" });
+	assert.equal(committingProfile.includes("edit"), false);
+	assert.equal(committingProfile.includes("write"), false);
 
-	const reviewingProfile = buildToolProfile(allTools, { phase: "reviewing", mode: "improvement" });
-	assert.equal(reviewingProfile.includes("edit"), false);
-	assert.equal(reviewingProfile.includes("write"), false);
-	assert.equal(reviewingProfile.includes("autodevelop_research"), true);
+	const relaunchingProfile = buildToolProfile(allTools, { phase: "relaunching", mode: "cycle" });
+	assert.equal(relaunchingProfile.includes("edit"), false);
+	assert.equal(relaunchingProfile.includes("write"), false);
+	assert.equal(relaunchingProfile.includes("autodevelop_research"), true);
 });
 
 test("implementation phases enable editing tools", () => {
-	const implementationProfile = buildToolProfile(allTools, { phase: "implementing", mode: "hardening" });
+	const implementationProfile = buildToolProfile(allTools, { phase: "implementing", mode: "cycle" });
 	assert.equal(implementationProfile.includes("edit"), true);
 	assert.equal(implementationProfile.includes("write"), true);
 	assert.equal(implementationProfile.includes("autodevelop_research"), true);
+
+	const testingProfile = buildToolProfile(allTools, { phase: "testing", mode: "cycle" });
+	assert.equal(testingProfile.includes("edit"), true);
+	assert.equal(testingProfile.includes("write"), true);
 });
 
 test("paused phases restore all discovered tools", () => {
-	const pausedProfile = buildToolProfile(allTools, { phase: "paused", mode: "improvement" });
+	const pausedProfile = buildToolProfile(allTools, { phase: "paused", mode: "cycle" });
 	assert.equal(pausedProfile.length, allTools.length);
 });

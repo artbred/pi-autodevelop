@@ -6,6 +6,7 @@ import { realpath } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 
 import { isGoalMutationCommand } from "./lib/bash-guard.js";
+import { readLoopStateCheckpoint, writeLoopStateCheckpoint } from "./lib/checkpoint.js";
 import {
 	BACKLOG_KINDS,
 	ITEM_STATUSES,
@@ -17,16 +18,31 @@ import {
 	RESEARCH_SCOPES,
 } from "./lib/constants.js";
 import {
+	assertCommitEligibility,
+	createCycleCommit,
+	getRecentAutoDevelopCommits,
+	resolveGitCycleContext,
+	stageCommitEligibleChanges,
+} from "./lib/git-cycle.js";
+import {
 	createGoalScaffoldContent,
 	makeGoalReadOnly,
 	readGoalSnapshot,
 	scaffoldGoalFile,
 	verifyGoalSnapshot,
 } from "./lib/goal.js";
+import {
+	acquireLoopLease,
+	describeLoopLease,
+	LEASE_HEARTBEAT_INTERVAL_MS,
+	readLoopLease,
+	refreshLoopLease,
+	releaseLoopLease,
+} from "./lib/lease.js";
 import { probeResearchProviders, runResearchAction } from "./lib/research.js";
+import { persistCycleSummary, persistResearchArtifactReview } from "./lib/review-log.js";
 import {
 	applyStateAction,
-	allEnabledQualityObjectivesResolved,
 	buildLoopContext,
 	cloneLoopState,
 	createInitialLoopState,
@@ -35,20 +51,14 @@ import {
 	getUnresolvedQualityObjectives,
 	getUnresolvedResearchBlockers,
 	isLoopRunning,
+	migrateLoopState,
 	nextRunnablePhase,
 	reconstructStateFromEntries,
 } from "./lib/state-machine.js";
 import { buildToolProfile } from "./lib/tool-profiles.js";
 import { detectUncertaintyMarker } from "./lib/uncertainty.js";
-import {
-	createVerificationRequest,
-	ensureVerifierPaths,
-	isVerificationReportStale,
-	persistVerificationReport,
-	persistVerificationRequest,
-	resolveVerifierBackend,
-	runVerifierWithFallback,
-} from "./lib/verifier.js";
+
+const NOOP_RETRY_DELAY_MS = 60000;
 
 const BacklogItemSchema = Type.Object({
 	id: Type.Optional(Type.String({ description: "Stable item id. Omit to auto-generate." })),
@@ -67,7 +77,6 @@ const BacklogItemSchema = Type.Object({
 	dependsOnResearchItemIds: Type.Optional(
 		Type.Array(Type.String({ description: "Research item ids that must complete before this item can complete." })),
 	),
-	verificationRequired: Type.Optional(Type.Boolean({ description: "Whether this item requires verifier approval before completion." })),
 });
 
 const BacklogItemPatchSchema = Type.Partial(
@@ -81,7 +90,6 @@ const BacklogItemPatchSchema = Type.Partial(
 		researchRequired: Type.Boolean(),
 		evidenceRefs: Type.Array(Type.String()),
 		dependsOnResearchItemIds: Type.Array(Type.String()),
-		verificationRequired: Type.Boolean(),
 	}),
 );
 
@@ -93,7 +101,6 @@ const AutoDevelopStateSchema = Type.Object({
 		"set_phase",
 		"update_objective",
 		"flag_uncertainty",
-		"request_verification",
 		"block",
 		"complete",
 	]),
@@ -110,7 +117,6 @@ const AutoDevelopStateSchema = Type.Object({
 	scope: Type.Optional(StringEnum(RESEARCH_SCOPES)),
 	objectiveRefs: Type.Optional(Type.Array(StringEnum(QUALITY_OBJECTIVE_NAMES))),
 	summary: Type.Optional(Type.String()),
-	verificationSummary: Type.Optional(Type.String()),
 	failure: Type.Optional(Type.String()),
 });
 
@@ -145,79 +151,32 @@ function formatProviderSummary(state: ReturnType<typeof cloneLoopState>) {
 		.join(", ");
 }
 
-function formatVerifierSummary(state: ReturnType<typeof cloneLoopState>) {
-	if (!state?.verifierBackend) return "verifier unknown";
-
-	const backend = state.verifierBackend;
-	if (!backend.available) {
-		return `${backend.resolved}:unavailable`;
-	}
-	if (backend.degradedReason) {
-		return `${backend.resolved}:degraded`;
-	}
-	return `${backend.resolved}:healthy`;
-}
-
 function truncateSingleLine(value: string, max = 160) {
 	const compact = value.replace(/\s+/g, " ").trim();
 	if (compact.length <= max) return compact;
 	return `${compact.slice(0, Math.max(0, max - 3)).trimEnd()}...`;
 }
 
-function uniqueStrings(values: string[]) {
-	return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
-}
-
-function buildVerifierRecoverySteps(message: string) {
-	const normalized = message.toLowerCase();
-	const steps = [];
-
-	if (normalized.includes("timed out after")) {
-		steps.push("Increase AUTODEVELOP_VERIFIER_TIMEOUT_MS or reduce verifier load.");
-	}
-	if (
-		normalized.includes("command not found")
-		|| normalized.includes("not found")
-		|| normalized.includes("no such file")
-	) {
-		steps.push("Install `pi` or set AUTODEVELOP_VERIFIER_PI_COMMAND to the correct executable.");
-	}
-	if (normalized.includes("api key") || normalized.includes("active model")) {
-		steps.push("Enable an inline verifier model/API key before retrying verification.");
+function formatRetryState(nextCycleAt?: string) {
+	if (!nextCycleAt) {
+		return {
+			active: false,
+			label: "none",
+		};
 	}
 
-	steps.push("Run `/autodevelop resume` after the verifier backend is healthy.");
-	return uniqueStrings(steps);
-}
+	const target = Date.parse(nextCycleAt);
+	if (!Number.isFinite(target)) {
+		return {
+			active: false,
+			label: "invalid",
+		};
+	}
 
-function formatVerificationReportStatus(report: { status: string; failureKind?: string }) {
-	return report.failureKind === "infrastructure" ? `${report.status}/infra` : report.status;
-}
-
-function createRequestId(prefix: string, itemId: string) {
-	return `${prefix}-${Date.now()}-${itemId.replace(/[^a-z0-9_-]+/gi, "-").slice(0, 40)}`;
-}
-
-function createVerifierFailureReport(
-	request: { id: string; fingerprint: string },
-	summary: string,
-	findings: string[] = [],
-	options: { failureKind?: "task" | "infrastructure"; recommendedNextSteps?: string[]; rawText?: string } = {},
-) {
+	const remainingMs = Math.max(0, target - Date.now());
 	return {
-		id: `report-${request.id}`,
-		requestId: request.id,
-		requestFingerprint: request.fingerprint,
-		createdAt: new Date().toISOString(),
-		status: "fail" as const,
-		failureKind: options.failureKind ?? "task",
-		summary,
-		findings,
-		missingEvidence: [],
-		recommendedNextSteps: options.recommendedNextSteps?.length
-			? options.recommendedNextSteps
-			: ["Address the verifier findings, then request verification again."],
-		rawText: options.rawText ?? "",
+		active: remainingMs > 0,
+		label: remainingMs > 0 ? `${Math.ceil(remainingMs / 1000)}s` : "ready",
 	};
 }
 
@@ -228,13 +187,7 @@ function buildQualityPrompt(state: ReturnType<typeof cloneLoopState>) {
 	const blockerText = researchBlockers.length ? researchBlockers.map((item) => item.title).join("; ") : "none";
 
 	if (!hasOpenBacklogItem(state)) {
-		if (state?.mode === "delivery") {
-			return `The backlog is empty. Replan delivery work so the plan already accounts for unresolved quality objectives: ${unresolvedText}.`;
-		}
-
-		if (state?.mode === "hardening" || state?.mode === "improvement") {
-			return `The backlog is empty. Replan immediately. Prioritize unresolved quality objectives first in this order: ${QUALITY_HARDENING_PRIORITY.join(", ")}. Unresolved: ${unresolvedText}.`;
-		}
+		return `The backlog is empty. Replan immediately against the same goal. Prioritize unresolved quality objectives in this order: ${QUALITY_HARDENING_PRIORITY.join(", ")}. Unresolved: ${unresolvedText}.`;
 	}
 
 	return `Unresolved quality objectives: ${unresolvedText}. Unresolved research blockers: ${blockerText}.`;
@@ -243,12 +196,7 @@ function buildQualityPrompt(state: ReturnType<typeof cloneLoopState>) {
 function buildLoopTurnPrompt(state: ReturnType<typeof cloneLoopState>, reason: string) {
 	const currentItem = state?.backlog.find((item) => item.id === state.currentItemId);
 	const currentItemLine = currentItem ? `Current item: [${currentItem.kind}] ${currentItem.title}` : "Current item: none";
-	const modeInstructions =
-		state?.mode === "delivery"
-			? `Stay in delivery mode until the primary goal is satisfied. When it is satisfied, call autodevelop_state with action="complete" to enter hardening mode.`
-			: state?.mode === "hardening"
-				? `You are in hardening mode. Do not treat the loop as done. Resolve enabled quality objectives before drifting into broader improvement work.`
-				: `You are in improvement mode. Keep finding justified ways to make the system better without waiting for a new user task.`;
+	const retry = formatRetryState(state?.nextCycleAt);
 
 	return `${LOOP_SKILL_COMMAND} reason=${reason}
 
@@ -256,24 +204,30 @@ Continue the autonomous development loop.
 
 Goal file: ${state?.goal?.path ?? "unknown"}
 Goal hash: ${state?.goal?.hash ?? "unknown"}
+Repo root: ${state?.repoRoot ?? "unknown"}
+Branch: ${state?.branch ?? "unknown"}
 Mode: ${state?.mode ?? "unknown"}
 Phase: ${state?.phase ?? "unknown"}
-Primary goal satisfied: ${state?.goalSatisfied ? "yes" : "no"}
+Cycle: ${state?.cycleNumber ?? 0}
 Iteration: ${state?.iteration ?? 0}
 Research providers: ${formatProviderSummary(state)}
-Verifier: ${formatVerifierSummary(state)}
+Last cycle commit: ${state?.lastCycleCommitSha ?? "none"}
+Last cycle summary: ${state?.lastCycleSummary || "none"}
+Last cycle noop: ${state?.lastCycleNoop ? "yes" : "no"}
+Next retry: ${retry.label}
 ${currentItemLine}
 
 Use autodevelop_state with action="get" first, then proceed with the next best action.
 Use autodevelop_research as the default research interface for repo and web research.
-If you hit uncertainty, unknown behavior, assumptions, or missing evidence during code/test/verify work, call autodevelop_state with action="flag_uncertainty" immediately and continue through a dedicated research item.
-Every backlog item is verifier-gated. When an item satisfies its acceptanceCriteria, call autodevelop_state with action="request_verification" instead of marking it done directly.
+If you hit uncertainty, unknown behavior, assumptions, or missing evidence during code or test work, call autodevelop_state with action="flag_uncertainty" immediately and continue through a dedicated research item.
+When an item satisfies its acceptanceCriteria and evidence requirements, use update_item to mark it done directly.
 If the backlog is empty, create one with replace_plan.
+Use autodevelop_state with action="complete" only when no pending or in-progress items remain, at least one item is done, and you can provide a non-empty completion summary. complete will create a git commit for this cycle and relaunch the same goal.
 Use autodevelop_state with action="block" only when the entire loop cannot proceed safely. If only one backlog item is blocked and other work remains, mark that item blocked and continue with the next runnable work.
 Use update_objective to record evidence as you address reliability, scalability, throughput, latency, memory efficiency, and performance.
+Runtime-only paths under .pi/autodevelop and .autodevelop are never committed.
 Inspect large-data and high-load behavior for chunking, batching, streaming, pagination, memory pressure, queue depth, retries, timeouts, idempotency, and backpressure unless explicitly opted out.
-${buildQualityPrompt(state)}
-${modeInstructions}`;
+${buildQualityPrompt(state)}`;
 }
 
 function renderResearchResultMarkdown(result: {
@@ -320,13 +274,100 @@ function extractAssistantTextFromEntries(entries: unknown[]) {
 	return "";
 }
 
+function getSessionMeta(ctx?: ExtensionContext | null) {
+	if (!ctx) {
+		return {
+			sessionId: "",
+			sessionFile: "",
+			cwd: "",
+		};
+	}
+
+	return {
+		sessionId: ctx.sessionManager.getSessionId?.() ?? "",
+		sessionFile: ctx.sessionManager.getSessionFile?.() ?? "",
+		cwd: ctx.cwd,
+	};
+}
+
+function formatLeaseSummary(
+	lease: Awaited<ReturnType<typeof readLoopLease>> | null,
+	currentSessionId = "",
+) {
+	const description = describeLoopLease(lease, { currentSessionId });
+	if (!description.present) {
+		return {
+			description,
+			owner: "none",
+			ownership: "no",
+			freshness: "idle",
+			age: "n/a",
+			statusToken: "none",
+		};
+	}
+
+	return {
+		description,
+		owner: description.ownerLabel,
+		ownership: description.isOwner ? "yes" : "no",
+		freshness: description.freshness,
+		age: description.ageLabel,
+		statusToken: description.isOwner ? "own" : `${description.isStale ? "other-stale" : "other"}@${description.ageLabel}`,
+	};
+}
+
+function appendLeaseSection(markdown: string, lease: Awaited<ReturnType<typeof readLoopLease>> | null, currentSessionId = "") {
+	const summary = formatLeaseSummary(lease, currentSessionId);
+	return `${markdown}
+
+### Lease
+
+- Owner: ${summary.owner}
+- Lease age: ${summary.age}
+- Freshness: ${summary.freshness}
+- Current session owns lease: ${summary.ownership}`;
+}
+
+function buildLeaseOwnershipError(lease: Awaited<ReturnType<typeof readLoopLease>> | null, currentSessionId = "") {
+	const summary = formatLeaseSummary(lease, currentSessionId);
+	if (!summary.description.present) {
+		return "AutoDevelop is read-only because no workspace lease is active. Use `/autodevelop resume` to acquire the lease or `/autodevelop recover` to take over a foreign lease explicitly.";
+	}
+
+	if (summary.description.isOwner) {
+		return "";
+	}
+
+	return `Another session owns the AutoDevelop workspace lease (\`${summary.owner}\`, ${summary.freshness}, age ${summary.age}). Use \`/autodevelop status\` to inspect or \`/autodevelop recover\` to take over explicitly.`;
+}
+
+function shouldRequireCleanRepoOnResume(state: ReturnType<typeof cloneLoopState>) {
+	if (!state) return true;
+	if (state.phase === "relaunching") return true;
+	if (state.backlog.length === 0) return true;
+	return false;
+}
+
+function cycleBlockersFromState(state: ReturnType<typeof cloneLoopState>) {
+	return state?.backlog?.filter((item) => item.status === "blocked").map((item) => item.title) ?? [];
+}
+
 export default function autodevelopExtension(pi: ExtensionAPI) {
 	let loopState: ReturnType<typeof cloneLoopState> | null = null;
+	let loopLease: Awaited<ReturnType<typeof readLoopLease>> | null = null;
 	let stateQueue = Promise.resolve();
 	let pendingAutoTurn = false;
 	let turnStartEntryCount = 0;
 	let sawResearchToolThisTurn = false;
 	let sawFlagUncertaintyThisTurn = false;
+	let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+	let noOpRetryTimer: ReturnType<typeof setTimeout> | null = null;
+	let lastHydrationSource: "none" | "session" | "checkpoint" = "none";
+	let currentSession = {
+		sessionId: "",
+		sessionFile: "",
+		cwd: "",
+	};
 
 	function emitLoopMessage(content: string) {
 		pi.sendMessage(
@@ -339,11 +380,38 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 		);
 	}
 
+	function rememberSession(ctx?: ExtensionContext | null) {
+		currentSession = getSessionMeta(ctx);
+	}
+
+	function currentSessionOwnsLease(ctx?: ExtensionContext | null) {
+		const meta = ctx ? getSessionMeta(ctx) : currentSession;
+		return Boolean(loopLease?.sessionId && loopLease.sessionId === meta.sessionId);
+	}
+
+	function stopNoOpRetry() {
+		if (!noOpRetryTimer) return;
+		clearTimeout(noOpRetryTimer);
+		noOpRetryTimer = null;
+	}
+
 	function updateLoopUi(ctx: ExtensionContext) {
 		if (!ctx.hasUI) return;
-		if (!loopState) {
+		const leaseSummary = formatLeaseSummary(loopLease, getSessionMeta(ctx).sessionId);
+		if (!loopState && !loopLease) {
 			ctx.ui.setStatus("autodevelop", undefined);
 			ctx.ui.setWidget("autodevelop", undefined);
+			return;
+		}
+
+		if (!loopState) {
+			ctx.ui.setStatus("autodevelop", `AD idle lease:${leaseSummary.statusToken}`);
+			ctx.ui.setWidget("autodevelop", [
+				"goal unknown",
+				"mode idle phase idle",
+				`lease owner ${leaseSummary.owner}`,
+				`lease age ${leaseSummary.age} freshness ${leaseSummary.freshness} owned ${leaseSummary.ownership}`,
+			]);
 			return;
 		}
 
@@ -351,54 +419,133 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 		const done = loopState.backlog.filter((item) => item.status === "done").length;
 		const unresolvedCount = getUnresolvedQualityObjectives(loopState).length;
 		const researchBlockers = getUnresolvedResearchBlockers(loopState).length;
-		const pendingReviews = loopState.pendingVerificationItemId ? 1 : 0;
-		const statusLine = `AD ${loopState.mode}/${loopState.phase} ${done}/${total} q:${unresolvedCount} r:${researchBlockers} v:${pendingReviews} goal:${basename(loopState.goal.path)}`;
+		const retry = formatRetryState(loopState.nextCycleAt);
+		const statusLine = `AD ${loopState.phase} c:${loopState.cycleNumber} ${done}/${total} q:${unresolvedCount} r:${researchBlockers} branch:${loopState.branch || "unknown"} lease:${leaseSummary.statusToken}`;
 		ctx.ui.setStatus("autodevelop", statusLine);
 
-		const latestReport = loopState.verificationReports?.slice(-1)[0];
 		const widgetLines = [
 			`goal ${basename(loopState.goal.path)} hash ${formatShortHash(loopState.goal.hash)}`,
-			`mode ${loopState.mode} phase ${loopState.phase} iteration ${loopState.iteration}`,
-			`quality ${unresolvedCount} research ${researchBlockers} review ${pendingReviews}`,
+			`phase ${loopState.phase} cycle ${loopState.cycleNumber} iteration ${loopState.iteration}`,
+			`branch ${loopState.branch || "unknown"} last_commit ${formatShortHash(loopState.lastCycleCommitSha)}`,
+			`last cycle ${truncateSingleLine(loopState.lastCycleSummary || "none", 120)}`,
+			`last noop ${loopState.lastCycleNoop ? "yes" : "no"} retry ${retry.label}`,
+			`lease owner ${leaseSummary.owner}`,
+			`lease age ${leaseSummary.age} freshness ${leaseSummary.freshness} owned ${leaseSummary.ownership}`,
 			`providers ${formatProviderSummary(loopState)}`,
-			`verifier ${formatVerifierSummary(loopState)}`,
 		];
-		if (loopState.verifierBackend?.degradedReason) {
-			widgetLines.push(`verifier detail ${truncateSingleLine(loopState.verifierBackend.degradedReason)}`);
-		}
-		if (latestReport) {
-			widgetLines.push(`last verifier [${formatVerificationReportStatus(latestReport)}] ${latestReport.summary || "No summary"}`);
-			if (latestReport.failureKind === "infrastructure" && latestReport.recommendedNextSteps?.length) {
-				widgetLines.push(`next action ${truncateSingleLine(latestReport.recommendedNextSteps[0])}`);
-			}
-		} else if (loopState.verifierBackend?.degradedReason) {
-			widgetLines.push("next action Fix the verifier backend, then run `/autodevelop resume`.");
-		}
 		for (const item of loopState.backlog.slice(0, 6)) {
 			const prefix = item.id === loopState.currentItemId ? ">" : "-";
 			const refs = item.objectiveRefs?.length ? ` -> ${item.objectiveRefs.join(",")}` : "";
 			const evidence = item.evidenceRefs?.length ? ` ev:${item.evidenceRefs.length}` : "";
-			const verification = item.verificationRequired ? ` vr:${item.verificationStatus}` : "";
-			widgetLines.push(`${prefix} [${item.status}] [${item.kind}] ${item.title}${refs}${evidence}${verification}`);
+			widgetLines.push(`${prefix} [${item.status}] [${item.kind}] ${item.title}${refs}${evidence}`);
 		}
 		ctx.ui.setWidget("autodevelop", widgetLines);
 	}
 
-	function persistControlState(reason: string) {
-		if (!loopState) return;
-		pi.appendEntry("autodevelop-control", {
-			reason,
-			timestamp: Date.now(),
-			state: cloneLoopState(loopState),
+	function stopLeaseHeartbeat() {
+		if (!heartbeatTimer) return;
+		clearInterval(heartbeatTimer);
+		heartbeatTimer = null;
+	}
+
+	function startLeaseHeartbeat() {
+		if (heartbeatTimer) return;
+		heartbeatTimer = setInterval(() => {
+			if (!loopState || !currentSessionOwnsLease()) return;
+			void withStateLock(async () => {
+				if (!loopState || !currentSessionOwnsLease()) return;
+				const refreshed = await refreshLoopLease({
+					cwd: currentSession.cwd || dirname(loopState.goal.path),
+					state: loopState,
+					sessionId: currentSession.sessionId,
+					sessionFile: currentSession.sessionFile,
+				});
+				if (refreshed) {
+					loopLease = refreshed;
+				}
+			});
+		}, LEASE_HEARTBEAT_INTERVAL_MS);
+		heartbeatTimer.unref?.();
+	}
+
+	function scheduleNoOpRetry(ctx: ExtensionContext, nextCycleAt: string) {
+		stopNoOpRetry();
+		const target = Date.parse(nextCycleAt);
+		if (!Number.isFinite(target)) return;
+		const delay = Math.max(0, target - Date.now());
+		noOpRetryTimer = setTimeout(() => {
+			void withStateLock(async () => {
+				if (!loopState || !currentSessionOwnsLease(ctx)) return;
+				if (loopState.nextCycleAt && Date.parse(loopState.nextCycleAt) > Date.now()) return;
+				loopState = cloneLoopState(loopState);
+				loopState.nextCycleAt = "";
+				loopState.phase = "planning";
+				await commitLoopState(ctx, "cycle:retry-ready");
+				await queueLoopTurn(ctx, "no-op-retry");
+			});
+		}, delay);
+		noOpRetryTimer.unref?.();
+	}
+
+	async function syncLeaseState(ctx?: ExtensionContext | null, state: ReturnType<typeof cloneLoopState> | null = loopState) {
+		if (ctx) rememberSession(ctx);
+		const cwd = ctx?.cwd ?? currentSession.cwd ?? state?.repoRoot ?? undefined;
+		loopLease = await readLoopLease({ cwd, state: state ?? undefined });
+		if (currentSessionOwnsLease()) {
+			startLeaseHeartbeat();
+		} else {
+			stopLeaseHeartbeat();
+		}
+	}
+
+	async function acquireLeaseForCurrentSession(ctx: ExtensionContext, { force = false } = {}) {
+		if (!loopState) return false;
+		rememberSession(ctx);
+		const result = await acquireLoopLease({
+			cwd: ctx.cwd,
+			state: loopState,
+			sessionId: currentSession.sessionId,
+			sessionFile: currentSession.sessionFile,
+			force,
 		});
+		if (!result.ok) {
+			loopLease = result.lease;
+			stopLeaseHeartbeat();
+			syncToolProfile();
+			updateLoopUi(ctx);
+			return false;
+		}
+		loopLease = result.lease;
+		startLeaseHeartbeat();
+		syncToolProfile();
+		updateLoopUi(ctx);
+		return true;
+	}
+
+	async function releaseOwnedLease(ctx?: ExtensionContext | null, { force = false } = {}) {
+		const meta = ctx ? getSessionMeta(ctx) : currentSession;
+		if (!meta.sessionId) return false;
+		const released = await releaseLoopLease({
+			cwd: meta.cwd || loopState?.repoRoot || undefined,
+			state: loopState ?? undefined,
+			sessionId: meta.sessionId,
+			force,
+		});
+		if (released || force) {
+			loopLease = null;
+			stopLeaseHeartbeat();
+		}
+		return released;
 	}
 
 	function syncToolProfile() {
-		if (!loopState) return;
-		const profile = buildToolProfile(pi.getAllTools(), loopState);
-		if (profile) {
-			pi.setActiveTools(profile);
+		const allToolNames = pi.getAllTools().map((tool) => tool.name);
+		if (!loopState || !currentSessionOwnsLease()) {
+			pi.setActiveTools(allToolNames);
+			return;
 		}
+		const profile = buildToolProfile(pi.getAllTools(), loopState);
+		pi.setActiveTools(profile?.length ? profile : allToolNames);
 	}
 
 	async function withStateLock<T>(fn: () => Promise<T>) {
@@ -410,30 +557,51 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 		return next;
 	}
 
-	async function refreshResearchProviders(ctx?: ExtensionContext, persistReason?: string) {
+	async function commitLoopState(ctx: ExtensionContext, reason: string) {
+		if (!loopState) return;
+		rememberSession(ctx);
+		pi.appendEntry("autodevelop-control", {
+			reason,
+			timestamp: Date.now(),
+			state: cloneLoopState(loopState),
+		});
+		await writeLoopStateCheckpoint(loopState, { cwd: ctx.cwd });
+		if (currentSessionOwnsLease(ctx)) {
+			const refreshed = await refreshLoopLease({
+				cwd: ctx.cwd,
+				state: loopState,
+				sessionId: currentSession.sessionId,
+				sessionFile: currentSession.sessionFile,
+			});
+			if (refreshed) {
+				loopLease = refreshed;
+			}
+		}
+		syncToolProfile();
+		updateLoopUi(ctx);
+	}
+
+	async function refreshResearchProviders() {
 		if (!loopState) return;
 		const providers = await probeResearchProviders();
 		loopState = applyStateAction(loopState, "sync_research_providers", { providers });
-		if (persistReason) persistControlState(persistReason);
-		syncToolProfile();
-		if (ctx) updateLoopUi(ctx);
 	}
 
-	async function refreshVerifierBackend(ctx?: ExtensionContext, persistReason?: string) {
+	async function refreshGitContext(ctx: ExtensionContext) {
 		if (!loopState) return;
-		const backend = resolveVerifierBackend({ cwd: ctx?.cwd ?? dirname(loopState.goal.path) ?? process.cwd() });
-		loopState = applyStateAction(loopState, "sync_verifier_backend", { backend });
-		if (persistReason) persistControlState(persistReason);
-		syncToolProfile();
-		if (ctx) updateLoopUi(ctx);
+		const gitContext = resolveGitCycleContext(ctx.cwd);
+		const recentCycleCommits = getRecentAutoDevelopCommits(gitContext.repoRoot, 5);
+		loopState = applyStateAction(loopState, "sync_git_context", {
+			repoRoot: gitContext.repoRoot,
+			branch: gitContext.branch,
+			recentCycleCommits,
+		});
 	}
 
 	async function markLoopBlocked(ctx: ExtensionContext, reason: string) {
 		if (!loopState) return;
 		loopState = applyStateAction(loopState, "block", { reason });
-		persistControlState("goal-integrity-failed");
-		syncToolProfile();
-		updateLoopUi(ctx);
+		await commitLoopState(ctx, "goal-integrity-failed");
 		emitLoopMessage(`## AutoDevelop Blocked\n\n${reason}`);
 	}
 
@@ -449,34 +617,65 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 		return false;
 	}
 
-	async function hydrateState(ctx: ExtensionContext) {
+	async function readStatusSnapshot(ctx: ExtensionContext) {
+		const state = loopState ?? (await readLoopStateCheckpoint(ctx.cwd));
+		const lease = await readLoopLease({ cwd: ctx.cwd, state: state ?? undefined });
+		return { state, lease };
+	}
+
+	async function hydrateState(ctx: ExtensionContext, { probe = false } = {}) {
+		rememberSession(ctx);
+		lastHydrationSource = "none";
 		loopState = reconstructStateFromEntries(ctx.sessionManager.getBranch());
 		if (loopState) {
-			await refreshResearchProviders(ctx);
-			await refreshVerifierBackend(ctx);
+			lastHydrationSource = "session";
+		} else {
+			loopState = await readLoopStateCheckpoint(ctx.cwd);
+			if (loopState) {
+				lastHydrationSource = "checkpoint";
+			}
+		}
+		loopState = migrateLoopState(loopState);
+		await syncLeaseState(ctx, loopState);
+		if (probe && loopState && currentSessionOwnsLease(ctx)) {
+			await refreshResearchProviders();
+			await refreshGitContext(ctx);
 		}
 		syncToolProfile();
 		updateLoopUi(ctx);
 	}
 
+	async function ensureLoopMutationOwnership(ctx: ExtensionContext) {
+		await syncLeaseState(ctx, loopState);
+		return currentSessionOwnsLease(ctx) ? "" : buildLeaseOwnershipError(loopLease, currentSession.sessionId);
+	}
+
+	async function commitCheckpointHydration(ctx: ExtensionContext) {
+		if (!loopState || lastHydrationSource !== "checkpoint" || !currentSessionOwnsLease(ctx)) return;
+		await commitLoopState(ctx, "hydrate-checkpoint");
+		lastHydrationSource = "session";
+	}
+
 	async function queueLoopTurn(ctx: ExtensionContext, reason: string) {
+		await syncLeaseState(ctx, loopState);
+		if (!currentSessionOwnsLease(ctx)) return;
 		if (!loopState || !isLoopRunning(loopState)) return;
-		if (loopState.pendingVerificationItemId) return;
 		if (pendingAutoTurn || ctx.hasPendingMessages()) return;
+		if (loopState.nextCycleAt && Date.parse(loopState.nextCycleAt) > Date.now()) return;
 		if (!(await ensureGoalIsUnchanged(ctx))) return;
 
-		loopState = cloneLoopState(loopState);
-		if (loopState.mode === "hardening" && allEnabledQualityObjectivesResolved(loopState)) {
-			loopState.mode = "improvement";
+		if (loopState.phase === "relaunching" && (!loopState.nextCycleAt || Date.parse(loopState.nextCycleAt) <= Date.now())) {
+			loopState = cloneLoopState(loopState);
+			loopState.phase = "planning";
+			loopState.nextCycleAt = "";
 		}
+
 		loopState.iteration += 1;
-		persistControlState(`queue:${reason}`);
-		syncToolProfile();
-		updateLoopUi(ctx);
+		await commitLoopState(ctx, `queue:${reason}`);
 
 		pendingAutoTurn = true;
 		try {
-			pi.sendUserMessage(buildLoopTurnPrompt(loopState, reason));
+			pi.sendUserMessage(appendLeaseSection(buildLoopTurnPrompt(loopState, reason), loopLease, currentSession.sessionId));
 		} catch (error) {
 			pendingAutoTurn = false;
 			const message = error instanceof Error ? error.message : String(error);
@@ -486,7 +685,7 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 
 	async function enforceUncertaintyResearch(ctx: ExtensionContext) {
 		if (!loopState || !isLoopRunning(loopState)) return false;
-		if (!["implementing", "testing", "verifying"].includes(loopState.phase)) return false;
+		if (!["implementing", "testing"].includes(loopState.phase)) return false;
 		if (sawFlagUncertaintyThisTurn || sawResearchToolThisTurn) return false;
 
 		const entries = ctx.sessionManager.getBranch().slice(turnStartEntryCount);
@@ -504,9 +703,7 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 			scope: "auto",
 			objectiveRefs: currentItem.objectiveRefs,
 		});
-		persistControlState("uncertainty-safety-net");
-		syncToolProfile();
-		updateLoopUi(ctx);
+		await commitLoopState(ctx, "uncertainty-safety-net");
 		emitLoopMessage(
 			`## AutoDevelop Research Required\n\nDetected uncertainty in the latest agent response ("${marker}"). The active item was paused and a linked research item was inserted before implementation can continue.`,
 		);
@@ -514,138 +711,367 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 		return true;
 	}
 
+	async function closeCurrentCycle(ctx: ExtensionContext) {
+		if (!loopState) {
+			throw new Error("No active loop state exists.");
+		}
+		if (!(await ensureGoalIsUnchanged(ctx))) {
+			throw new Error("Goal integrity failed while closing the cycle.");
+		}
+
+		await refreshGitContext(ctx);
+		assertCommitEligibility(loopState.repoRoot, { allowDirty: true });
+
+		const cycleNumber = loopState.cycleNumber;
+		const summary = loopState.completionSummary;
+		const blockers = cycleBlockersFromState(loopState);
+		const staged = stageCommitEligibleChanges(loopState.repoRoot);
+
+		if (!staged.hasStagedChanges) {
+			const nextCycleAt = new Date(Date.now() + NOOP_RETRY_DELAY_MS).toISOString();
+			const recentCycleCommits = getRecentAutoDevelopCommits(loopState.repoRoot, 5);
+			loopState = applyStateAction(loopState, "record_cycle_result", {
+				summary,
+				commitSha: "",
+				changedFiles: [],
+				noop: true,
+				blockers,
+				nextCycleAt,
+				recentCycleCommits,
+			});
+			await persistCycleSummary({
+				cycleNumber,
+				branch: loopState.branch,
+				completionSummary: summary,
+				commitSha: "",
+				diffStat: "No commit was created because no non-runtime changes were staged.",
+				changedFiles: [],
+				blockers,
+				noop: true,
+				cwd: ctx.cwd,
+				state: loopState,
+			});
+			await commitLoopState(ctx, "cycle:no-op");
+			await ctx.compact?.();
+			loopState = applyStateAction(loopState, "begin_next_cycle", {
+				nextCycleAt,
+				recentCycleCommits,
+			});
+			await commitLoopState(ctx, "cycle:relaunch");
+			scheduleNoOpRetry(ctx, nextCycleAt);
+			return {
+				noop: true,
+				commitSha: "",
+				changedFiles: [],
+				diffStat: "",
+				nextCycleAt,
+			};
+		}
+
+		const commit = createCycleCommit(loopState.repoRoot, cycleNumber, summary);
+		const recentCycleCommits = getRecentAutoDevelopCommits(loopState.repoRoot, 5);
+		loopState = applyStateAction(loopState, "record_cycle_result", {
+			summary,
+			commitSha: commit.commitSha,
+			changedFiles: staged.changedFiles,
+			noop: false,
+			blockers,
+			nextCycleAt: "",
+			recentCycleCommits,
+		});
+		await persistCycleSummary({
+			cycleNumber,
+			branch: loopState.branch,
+			completionSummary: summary,
+			commitSha: commit.commitSha,
+			diffStat: staged.diffStat,
+			changedFiles: staged.changedFiles,
+			blockers,
+			noop: false,
+			cwd: ctx.cwd,
+			state: loopState,
+		});
+		await commitLoopState(ctx, "cycle:commit");
+		await ctx.compact?.();
+		loopState = applyStateAction(loopState, "begin_next_cycle", {
+			recentCycleCommits,
+		});
+		await commitLoopState(ctx, "cycle:relaunch");
+		await queueLoopTurn(ctx, "cycle-complete");
+		return {
+			noop: false,
+			commitSha: commit.commitSha,
+			changedFiles: staged.changedFiles,
+			diffStat: staged.diffStat,
+			nextCycleAt: "",
+		};
+	}
+
 	pi.registerCommand("autodevelop", {
 		description: "Manage the autonomous goal-driven development loop",
-		handler: async (args, ctx) => {
-			const trimmedArgs = args.trim();
-			const [subcommand = "", ...rest] = trimmedArgs.split(/\s+/).filter(Boolean);
-			const subcommandArgs = rest.join(" ");
+		handler: async (args, ctx) =>
+			withStateLock(async () => {
+				rememberSession(ctx);
+				const trimmedArgs = args.trim();
+				const [subcommand = "", ...rest] = trimmedArgs.split(/\s+/).filter(Boolean);
+				const subcommandArgs = rest.join(" ");
 
-			switch (subcommand) {
-				case "scaffold": {
-					if (!subcommandArgs) {
-						ctx.ui.notify("Usage: /autodevelop scaffold <goalPath>", "warning");
+				switch (subcommand) {
+					case "scaffold": {
+						if (!subcommandArgs) {
+							ctx.ui.notify("Usage: /autodevelop scaffold <goalPath>", "warning");
+							return;
+						}
+
+						try {
+							const goalPath = await scaffoldGoalFile(ctx.cwd, subcommandArgs);
+							emitLoopMessage(`## AutoDevelop Goal Scaffolded\n\nCreated \`${goalPath}\`.\n\n${createGoalScaffoldContent()}`);
+						} catch (error) {
+							ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+						}
 						return;
 					}
 
-					try {
-						const goalPath = await scaffoldGoalFile(ctx.cwd, subcommandArgs);
-						emitLoopMessage(`## AutoDevelop Goal Scaffolded\n\nCreated \`${goalPath}\`.\n\n${createGoalScaffoldContent()}`);
-					} catch (error) {
-						ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
-					}
-					return;
-				}
+					case "start": {
+						if (!subcommandArgs) {
+							ctx.ui.notify("Usage: /autodevelop start <goalPath>", "warning");
+							return;
+						}
 
-				case "start": {
-					if (!subcommandArgs) {
-						ctx.ui.notify("Usage: /autodevelop start <goalPath>", "warning");
+						try {
+							await hydrateState(ctx);
+							const existingCheckpoint = await readLoopStateCheckpoint(ctx.cwd);
+							const existingLease = await readLoopLease({
+								cwd: ctx.cwd,
+								state: existingCheckpoint ?? loopState ?? undefined,
+							});
+							if (existingLease) {
+								loopLease = existingLease;
+								syncToolProfile();
+								updateLoopUi(ctx);
+								ctx.ui.notify(
+									`Cannot start a new AutoDevelop loop while a workspace lease exists. ${buildLeaseOwnershipError(existingLease, currentSession.sessionId)}`,
+									"warning",
+								);
+								return;
+							}
+							if (existingCheckpoint || loopState) {
+								ctx.ui.notify(
+									"A recoverable AutoDevelop checkpoint already exists for this workspace. Use `/autodevelop resume` or `/autodevelop recover` instead of `start`.",
+									"warning",
+								);
+								return;
+							}
+
+							const goalSnapshot = await readGoalSnapshot(ctx.cwd, subcommandArgs);
+							const providers = await probeResearchProviders();
+							const gitContext = resolveGitCycleContext(ctx.cwd);
+							assertCommitEligibility(gitContext.repoRoot);
+							goalSnapshot.readonlyProtection = await makeGoalReadOnly(goalSnapshot.path);
+							loopState = createInitialLoopState(goalSnapshot, providers, {
+								repoRoot: gitContext.repoRoot,
+								branch: gitContext.branch,
+								recentCycleCommits: getRecentAutoDevelopCommits(gitContext.repoRoot, 5),
+							});
+							if (!(await acquireLeaseForCurrentSession(ctx))) {
+								ctx.ui.notify(buildLeaseOwnershipError(loopLease, currentSession.sessionId), "warning");
+								return;
+							}
+							await commitLoopState(ctx, "start");
+							emitLoopMessage(
+								appendLeaseSection(
+									`## AutoDevelop Started\n\n- Goal: \`${goalSnapshot.path}\`\n- Hash: \`${goalSnapshot.hash}\`\n- Read-only protection: ${goalSnapshot.readonlyProtection ? "enabled" : "best effort only"}\n- Branch: ${loopState.branch}\n- Research providers: ${formatProviderSummary(loopState)}`,
+									loopLease,
+									currentSession.sessionId,
+								),
+							);
+							await queueLoopTurn(ctx, "start");
+						} catch (error) {
+							ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+						}
 						return;
 					}
 
-					try {
-						const goalSnapshot = await readGoalSnapshot(ctx.cwd, subcommandArgs);
-						const providers = await probeResearchProviders();
-						const verifierBackend = resolveVerifierBackend({ cwd: ctx.cwd });
-						goalSnapshot.readonlyProtection = await makeGoalReadOnly(goalSnapshot.path);
-						loopState = createInitialLoopState(goalSnapshot, providers, verifierBackend);
-						persistControlState("start");
+					case "status": {
+						const snapshot = await readStatusSnapshot(ctx);
+						emitLoopMessage(appendLeaseSection(formatLoopStateMarkdown(snapshot.state), snapshot.lease, currentSession.sessionId));
+						return;
+					}
+
+					case "pause": {
+						if (!loopState) {
+							ctx.ui.notify("No active autodevelop loop.", "warning");
+							return;
+						}
+						const ownershipError = await ensureLoopMutationOwnership(ctx);
+						if (ownershipError) {
+							ctx.ui.notify(ownershipError, "warning");
+							return;
+						}
+
+						stopNoOpRetry();
+						loopState = applyStateAction(loopState, "set_phase", { phase: "paused" });
+						await commitLoopState(ctx, "pause");
+						emitLoopMessage("## AutoDevelop Paused");
+						return;
+					}
+
+					case "resume": {
+						await hydrateState(ctx);
+						if (!loopState) {
+							ctx.ui.notify("No autodevelop loop to resume.", "warning");
+							return;
+						}
+						if (loopLease && !currentSessionOwnsLease(ctx)) {
+							ctx.ui.notify(buildLeaseOwnershipError(loopLease, currentSession.sessionId), "warning");
+							return;
+						}
+						if (!(await acquireLeaseForCurrentSession(ctx))) {
+							ctx.ui.notify(buildLeaseOwnershipError(loopLease, currentSession.sessionId), "warning");
+							return;
+						}
+						await commitCheckpointHydration(ctx);
+						await refreshResearchProviders();
+						await refreshGitContext(ctx);
+						if (shouldRequireCleanRepoOnResume(loopState)) {
+							assertCommitEligibility(loopState.repoRoot);
+						}
+						if (loopState.nextCycleAt && Date.parse(loopState.nextCycleAt) <= Date.now()) {
+							loopState = cloneLoopState(loopState);
+							loopState.nextCycleAt = "";
+							loopState.phase = "planning";
+						}
+						const nextPhase = loopState.nextCycleAt
+							? "relaunching"
+							: nextRunnablePhase({
+									...loopState,
+									phase: "planning",
+								});
+						loopState = applyStateAction(loopState, "set_phase", {
+							phase: nextPhase,
+							currentItemId: loopState.currentItemId ?? undefined,
+							failure: "",
+						});
+						loopState.stopReason = "";
+						await commitLoopState(ctx, "resume");
+						emitLoopMessage(
+							appendLeaseSection(`## AutoDevelop Resumed\n\nPhase: \`${nextPhase}\`\n\nBranch: \`${loopState.branch}\``, loopLease, currentSession.sessionId),
+						);
+						if (loopState.nextCycleAt) {
+							scheduleNoOpRetry(ctx, loopState.nextCycleAt);
+						} else {
+							await queueLoopTurn(ctx, "resume");
+						}
+						return;
+					}
+
+					case "recover": {
+						await hydrateState(ctx);
+						if (!loopState) {
+							ctx.ui.notify("No autodevelop loop checkpoint is available to recover.", "warning");
+							return;
+						}
+
+						if (loopLease && !currentSessionOwnsLease(ctx)) {
+							const summary = formatLeaseSummary(loopLease, currentSession.sessionId);
+							if (ctx.hasUI) {
+								const confirmed = await ctx.ui.confirm(
+									"Recover AutoDevelop loop?",
+									`Take over the workspace lease from ${summary.owner} (${summary.freshness}, age ${summary.age})?`,
+								);
+								if (!confirmed) return;
+							}
+						}
+
+						if (!(await acquireLeaseForCurrentSession(ctx, { force: Boolean(loopLease && !currentSessionOwnsLease(ctx)) }))) {
+							ctx.ui.notify(buildLeaseOwnershipError(loopLease, currentSession.sessionId), "warning");
+							return;
+						}
+						await commitCheckpointHydration(ctx);
+						await refreshResearchProviders();
+						await refreshGitContext(ctx);
+						if (shouldRequireCleanRepoOnResume(loopState)) {
+							assertCommitEligibility(loopState.repoRoot);
+						}
+						if (loopState.nextCycleAt && Date.parse(loopState.nextCycleAt) <= Date.now()) {
+							loopState = cloneLoopState(loopState);
+							loopState.nextCycleAt = "";
+							loopState.phase = "planning";
+						}
+						const nextPhase = loopState.nextCycleAt
+							? "relaunching"
+							: nextRunnablePhase({
+									...loopState,
+									phase: "planning",
+								});
+						loopState = applyStateAction(loopState, "set_phase", {
+							phase: nextPhase,
+							currentItemId: loopState.currentItemId ?? undefined,
+							failure: "",
+						});
+						loopState.stopReason = "";
+						await commitLoopState(ctx, "recover");
+						emitLoopMessage(
+							appendLeaseSection(`## AutoDevelop Recovered\n\nPhase: \`${nextPhase}\`\n\nBranch: \`${loopState.branch}\``, loopLease, currentSession.sessionId),
+						);
+						if (loopState.nextCycleAt) {
+							scheduleNoOpRetry(ctx, loopState.nextCycleAt);
+						} else {
+							await queueLoopTurn(ctx, "recover");
+						}
+						return;
+					}
+
+					case "stop": {
+						if (!loopState) {
+							ctx.ui.notify("No autodevelop loop to stop.", "warning");
+							return;
+						}
+						const ownershipError = await ensureLoopMutationOwnership(ctx);
+						if (ownershipError) {
+							ctx.ui.notify(ownershipError, "warning");
+							return;
+						}
+
+						stopNoOpRetry();
+						loopState = cloneLoopState(loopState);
+						loopState.phase = "stopped";
+						loopState.stopReason = "Stopped by user";
+						await commitLoopState(ctx, "stop");
+						await releaseOwnedLease(ctx);
 						syncToolProfile();
 						updateLoopUi(ctx);
-						emitLoopMessage(
-							`## AutoDevelop Started\n\n- Goal: \`${goalSnapshot.path}\`\n- Hash: \`${goalSnapshot.hash}\`\n- Read-only protection: ${goalSnapshot.readonlyProtection ? "enabled" : "best effort only"}\n- Default hardening priorities: ${QUALITY_HARDENING_PRIORITY.join(", ")}\n- Research providers: ${formatProviderSummary(loopState)}\n- Verifier: ${formatVerifierSummary(loopState)}`,
-						);
-						await queueLoopTurn(ctx, "start");
-					} catch (error) {
-						ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
-					}
-					return;
-				}
-
-				case "status": {
-					emitLoopMessage(formatLoopStateMarkdown(loopState));
-					return;
-				}
-
-				case "pause": {
-					if (!loopState) {
-						ctx.ui.notify("No active autodevelop loop.", "warning");
+						emitLoopMessage("## AutoDevelop Stopped\n\nThe loop will not auto-continue.");
 						return;
 					}
 
-					loopState = applyStateAction(loopState, "set_phase", { phase: "paused" });
-					persistControlState("pause");
-					syncToolProfile();
-					updateLoopUi(ctx);
-					emitLoopMessage("## AutoDevelop Paused");
-					return;
-				}
-
-				case "resume": {
-					if (!loopState) {
-						ctx.ui.notify("No autodevelop loop to resume.", "warning");
-						return;
+					default: {
+						ctx.ui.notify("Usage: /autodevelop <start|status|pause|resume|recover|stop|scaffold> [args]", "info");
 					}
-
-					await refreshResearchProviders(ctx, "resume-providers");
-					await refreshVerifierBackend(ctx, "resume-verifier");
-					const nextPhase = nextRunnablePhase(loopState);
-					loopState = applyStateAction(loopState, "set_phase", {
-						phase: nextPhase,
-						currentItemId: loopState.currentItemId ?? undefined,
-						failure: "",
-					});
-					loopState.stopReason = "";
-					persistControlState("resume");
-					syncToolProfile();
-					updateLoopUi(ctx);
-					emitLoopMessage(`## AutoDevelop Resumed\n\nMode: \`${loopState.mode}\`\n\nPhase: \`${nextPhase}\``);
-					await queueLoopTurn(ctx, "resume");
-					return;
 				}
-
-				case "stop": {
-					if (!loopState) {
-						ctx.ui.notify("No autodevelop loop to stop.", "warning");
-						return;
-					}
-
-					loopState = cloneLoopState(loopState);
-					loopState.phase = "stopped";
-					loopState.stopReason = "Stopped by user";
-					persistControlState("stop");
-					syncToolProfile();
-					updateLoopUi(ctx);
-					emitLoopMessage("## AutoDevelop Stopped\n\nThe loop will not auto-continue.");
-					return;
-				}
-
-				default: {
-					ctx.ui.notify("Usage: /autodevelop <start|status|pause|resume|stop|scaffold> [args]", "info");
-				}
-			}
-		},
+			}),
 	});
 
 	pi.registerTool({
 		name: "autodevelop_state",
 		label: "AutoDevelop State",
 		description:
-			"Manage the autonomous development loop state. Use get before acting, replace_plan to define backlog items, update_item as work progresses, request_verification to trigger the external verifier gate, set_phase to match the work phase, update_objective to record hardening evidence, flag_uncertainty when research is required, block when stuck, and complete only after the primary goal is satisfied and the active item has already passed verification.",
-		promptSnippet: "Inspect and update the autonomous loop state, research blockers, verifier-gated backlog, hardening objectives, phase, and completion status.",
+			"Manage the autonomous development loop state. Use get before acting, replace_plan to define backlog items, update_item as work progresses, set_phase to match the work phase, update_objective to record quality evidence, flag_uncertainty when research is required, block when stuck, and complete to close the current git-backed cycle and relaunch the same goal.",
+		promptSnippet: "Inspect and update the autonomous loop state, research blockers, git cycle backlog, quality objectives, phase, and completion status.",
 		promptGuidelines: [
 			"Call autodevelop_state with action=get before replacing the plan or claiming completion.",
-			"Keep backlog kinds to research, code, test, or verify.",
+			"Keep backlog kinds to research, code, or test.",
 			"Unless the goal file explicitly opts out, treat reliability, scalability, throughput, latency, memory efficiency, and performance as default success dimensions.",
 			"Use autodevelop_research as the default research interface.",
-			"Use flag_uncertainty immediately when code, test, or verify work hits assumptions, unknown behavior, unclear failures, or missing evidence.",
-			"Every backlog item is verifier-gated. When an item satisfies its acceptanceCriteria, use request_verification instead of marking it done directly.",
+			"Use flag_uncertainty immediately when code or test work hits assumptions, unknown behavior, unclear failures, or missing evidence.",
+			"Mark items done directly once acceptance criteria and required evidence are satisfied.",
 			"Tag backlog items with objectiveRefs and attach evidenceRefs when research unblocks later work.",
 			"Use update_objective with evidence as you address quality objectives.",
 			"Use block only when the entire loop cannot proceed safely or the goal cannot be met with the current constraints. If a single item is blocked but other work remains, block that item and continue.",
+			"Use complete only when the cycle is ready to commit and restart on the same goal.",
 		],
 		parameters: AutoDevelopStateSchema,
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			return withStateLock(async () => {
 				if (!loopState) {
 					return {
@@ -656,98 +1082,33 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 				}
 
 				try {
+					if (params.action !== "get") {
+						const ownershipError = await ensureLoopMutationOwnership(ctx);
+						if (ownershipError) {
+							return {
+								content: [{ type: "text", text: `Error: ${ownershipError}` }],
+								details: cloneLoopState(loopState),
+								isError: true,
+							};
+						}
+					}
+
 					if (params.action === "flag_uncertainty") {
 						sawFlagUncertaintyThisTurn = true;
 					}
 
-					if (params.action === "request_verification") {
-						await refreshVerifierBackend(ctx);
-
-						const requestId = createRequestId("verify", params.itemId ?? "item");
-						loopState = applyStateAction(loopState, "request_verification", { ...params, requestId });
-						const request = await createVerificationRequest({
-							cwd: ctx.cwd,
-							state: loopState,
-							itemId: params.itemId,
-							backend: loopState.verifierBackend,
-							requestId,
-						});
-						const paths = await ensureVerifierPaths(ctx.cwd, loopState.verifierBackend);
-						await persistVerificationRequest(paths, request);
-						loopState = applyStateAction(loopState, "record_verification_request", { request });
-						persistControlState("verification:request");
-						syncToolProfile();
-						updateLoopUi(ctx);
-
-						let report;
-						try {
-							const apiKey = ctx.model ? await ctx.modelRegistry.getApiKey(ctx.model) : null;
-							const verification = await runVerifierWithFallback({
-								request,
-								backend: loopState.verifierBackend,
-								paths,
-								model: ctx.model,
-								apiKey,
-								signal,
-								completeFn: complete,
-							});
-							report = verification.report;
-							if (verification.backend && verification.backend !== loopState.verifierBackend) {
-								loopState = applyStateAction(loopState, "sync_verifier_backend", {
-									backend: verification.backend,
-								});
-							}
-						} catch (error) {
-							const message = error instanceof Error ? error.message : String(error);
-							loopState = applyStateAction(loopState, "sync_verifier_backend", {
-								backend: {
-									...loopState.verifierBackend,
-									degradedReason: message,
-								},
-							});
-							report = createVerifierFailureReport(
-								request,
-								`Verifier backend failed while reviewing "${request.itemTitle}": ${truncateSingleLine(message)}`,
-								[message],
-								{
-									failureKind: "infrastructure",
-									recommendedNextSteps: buildVerifierRecoverySteps(message),
-									rawText: message,
-								},
-							);
-						}
-
-						await persistVerificationReport(paths, report);
-						if (isVerificationReportStale(request, loopState)) {
-							loopState = applyStateAction(loopState, "discard_verification_request", {
-								requestId: request.id,
-								reason: `Discarded stale verifier result for request ${request.id} because the task changed while review was running.`,
-							});
-							persistControlState("verification:stale");
-							syncToolProfile();
-							updateLoopUi(ctx);
-
-							return {
-								content: [
-									{
-										type: "text",
-										text: `## AutoDevelop Verification\n\nVerifier result for \`${request.itemTitle}\` was discarded because the task changed while review was running.\n\n${formatLoopStateMarkdown(loopState)}`,
-									},
-								],
-								details: cloneLoopState(loopState),
-							};
-						}
-
-						loopState = applyStateAction(loopState, "apply_verification_report", { report });
-						persistControlState(`verification:${report.status}`);
-						syncToolProfile();
-						updateLoopUi(ctx);
+					if (params.action === "complete") {
+						loopState = applyStateAction(loopState, params.action, params);
+						await commitLoopState(ctx, "state:complete");
+						const result = await closeCurrentCycle(ctx);
 
 						return {
 							content: [
 								{
 									type: "text",
-									text: `## AutoDevelop Verification\n\n- Item: \`${request.itemTitle}\`\n- Result: \`${report.status}\`\n- Summary: ${report.summary || "No summary"}\n\n${formatLoopStateMarkdown(loopState)}`,
+									text: result.noop
+										? `## AutoDevelop Cycle Closed\n\nNo commit was created because no non-runtime changes were present. The same goal will retry after ${formatRetryState(result.nextCycleAt).label}.\n\n${formatLoopStateMarkdown(loopState)}`
+										: `## AutoDevelop Cycle Closed\n\n- Commit: \`${result.commitSha}\`\n- Changed files: ${result.changedFiles.join(", ") || "none"}\n\n${formatLoopStateMarkdown(loopState)}`,
 								},
 							],
 							details: cloneLoopState(loopState),
@@ -755,14 +1116,9 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 					}
 
 					loopState = applyStateAction(loopState, params.action, params);
-					if (params.action === "flag_uncertainty") {
-						persistControlState("flag-uncertainty");
+					if (params.action !== "get") {
+						await commitLoopState(ctx, `state:${params.action}`);
 					}
-					if (params.action === "complete") {
-						persistControlState("complete");
-					}
-					syncToolProfile();
-					updateLoopUi(ctx);
 
 					return {
 						content: [{ type: "text", text: formatLoopStateMarkdown(loopState) }],
@@ -789,7 +1145,7 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 			"Use action=health to inspect provider availability and fallback order.",
 			"Use action=query for repo or web research. Prefer scope=repo or scope=auto unless you explicitly need web-only research.",
 			"Use action=fetch to capture a local file, URL, or prior artifact as durable evidence.",
-			"If you are in code, test, or verify work and research is needed, call autodevelop_state action=flag_uncertainty first. If you forget, the extension will pause the active item automatically when this tool runs.",
+			"If you are in code or test work and research is needed, call autodevelop_state action=flag_uncertainty first. If you forget, the extension will pause the active item automatically when this tool runs.",
 			"Carry objectiveRefs when the research relates to reliability, scalability, throughput, latency, memory, or performance.",
 		],
 		parameters: AutoDevelopResearchSchema,
@@ -804,9 +1160,18 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 				}
 
 				try {
+					const ownershipError = await ensureLoopMutationOwnership(ctx);
+					if (ownershipError) {
+						return {
+							content: [{ type: "text", text: `Error: ${ownershipError}` }],
+							details: cloneLoopState(loopState),
+							isError: true,
+						};
+					}
+
 					if (
 						(params.action === "query" || params.action === "fetch") &&
-						["implementing", "testing", "verifying"].includes(loopState.phase)
+						["implementing", "testing"].includes(loopState.phase)
 					) {
 						const currentItem = loopState.backlog.find((item) => item.id === loopState.currentItemId);
 						if (currentItem && currentItem.kind !== "research" && !sawFlagUncertaintyThisTurn) {
@@ -818,7 +1183,7 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 								objectiveRefs: params.objectiveRefs ?? currentItem.objectiveRefs,
 							});
 							sawFlagUncertaintyThisTurn = true;
-							persistControlState("auto-flag-uncertainty");
+							await commitLoopState(ctx, "auto-flag-uncertainty");
 						}
 					}
 
@@ -831,13 +1196,21 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 					loopState = applyStateAction(loopState, "sync_research_providers", { providers: research.providers });
 					if (research.artifact) {
 						loopState = applyStateAction(loopState, "record_research_artifact", { artifact: research.artifact });
+						const activeItemTitle =
+							loopState.backlog.find((item) => item.id === loopState.currentItemId)?.title
+							|| loopState.backlog.find((item) => item.evidenceRefs?.includes(research.artifact.id))?.title
+							|| "";
+						await persistResearchArtifactReview({
+							artifact: research.artifact,
+							cwd: ctx.cwd,
+							state: loopState,
+							itemTitle: activeItemTitle,
+						});
 					}
 					if (params.action !== "health") {
 						sawResearchToolThisTurn = true;
 					}
-					persistControlState(`research:${params.action}`);
-					syncToolProfile();
-					updateLoopUi(ctx);
+					await commitLoopState(ctx, `research:${params.action}`);
 
 					return {
 						content: [
@@ -871,16 +1244,57 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		await hydrateState(ctx);
+		await withStateLock(async () => {
+			await hydrateState(ctx);
+		});
+	});
+	pi.on("session_before_switch", async (_event, ctx) => {
+		await withStateLock(async () => {
+			rememberSession(ctx);
+			stopNoOpRetry();
+			await releaseOwnedLease(ctx);
+			loopState = null;
+			loopLease = null;
+			lastHydrationSource = "none";
+			stopLeaseHeartbeat();
+			syncToolProfile();
+			updateLoopUi(ctx);
+		});
 	});
 	pi.on("session_switch", async (_event, ctx) => {
-		await hydrateState(ctx);
+		await withStateLock(async () => {
+			await hydrateState(ctx);
+		});
+	});
+	pi.on("session_before_fork", async (_event, ctx) => {
+		await withStateLock(async () => {
+			rememberSession(ctx);
+			stopNoOpRetry();
+			await releaseOwnedLease(ctx);
+			loopLease = null;
+			stopLeaseHeartbeat();
+		});
 	});
 	pi.on("session_fork", async (_event, ctx) => {
-		await hydrateState(ctx);
+		await withStateLock(async () => {
+			await hydrateState(ctx);
+		});
 	});
 	pi.on("session_tree", async (_event, ctx) => {
-		await hydrateState(ctx);
+		await withStateLock(async () => {
+			await hydrateState(ctx);
+		});
+	});
+	pi.on("session_shutdown", async (_event, ctx) => {
+		await withStateLock(async () => {
+			rememberSession(ctx);
+			stopNoOpRetry();
+			await releaseOwnedLease(ctx);
+			loopState = null;
+			loopLease = null;
+			lastHydrationSource = "none";
+			stopLeaseHeartbeat();
+		});
 	});
 
 	pi.on("input", async (event) => {
@@ -899,6 +1313,8 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", async (_event, ctx) => {
+		await syncLeaseState(ctx, loopState);
+		if (!currentSessionOwnsLease(ctx)) return;
 		if (!loopState || !isLoopRunning(loopState)) return;
 		if (!(await ensureGoalIsUnchanged(ctx))) return;
 
@@ -909,7 +1325,7 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 		return {
 			message: {
 				customType: "autodevelop-context",
-				content: buildLoopContext(loopState),
+				content: appendLeaseSection(buildLoopContext(loopState), loopLease, getSessionMeta(ctx).sessionId),
 				display: false,
 			},
 		};
@@ -917,13 +1333,21 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 
 	pi.on("agent_end", async (_event, ctx) => {
 		pendingAutoTurn = false;
+		await syncLeaseState(ctx, loopState);
+		if (!currentSessionOwnsLease(ctx)) return;
 		if (!loopState || !isLoopRunning(loopState)) return;
 		if (ctx.hasPendingMessages()) return;
 		if (await enforceUncertaintyResearch(ctx)) return;
+		if (loopState.nextCycleAt && Date.parse(loopState.nextCycleAt) > Date.now()) {
+			scheduleNoOpRetry(ctx, loopState.nextCycleAt);
+			return;
+		}
 		await queueLoopTurn(ctx, "continue");
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
+		await syncLeaseState(ctx, loopState);
+		if (!currentSessionOwnsLease(ctx)) return;
 		if (!loopState?.goal?.path) return;
 
 		if (event.toolName === "write" || event.toolName === "edit") {
@@ -966,30 +1390,24 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 		const researchBlockers = getUnresolvedResearchBlockers(loopState)
 			.map((item) => `- ${item.title} (${item.id})`)
 			.join("\n");
-		const verificationReports = (loopState.verificationReports ?? [])
-			.slice(-5)
-			.reverse()
-			.map((report) => `- ${report.requestId} [${report.status}] ${report.summary || "No summary."}`)
+		const recentCommits = (loopState.recentCycleCommits ?? [])
+			.slice(0, 5)
+			.map((commit) => `- ${commit.shortSha || commit.sha.slice(0, 12)} ${commit.subject}`)
 			.join("\n");
-		const pendingVerification = loopState.pendingVerificationItemId
-			? `- pending item: ${loopState.pendingVerificationItemId}`
-			: "- pending item: none";
 		const summaryPrompt = `You are compacting a pi session that is running an autonomous coding loop.
 
 Preserve the following as first-class data:
-- current mode, phase, and iteration
+- current phase, iteration, cycle number, and branch
 - immutable goal path, hash, and snapshot
-- explicit opt-outs
 - research provider health and fallback status
-- verifier backend health and degraded reason
 - recent research artifacts with ids, provider, summary, and source refs
 - unresolved research blockers and which items depend on them
 - quality objectives with status and evidence
-- unfinished backlog items with status, kind, objectiveRefs, evidenceRefs, research dependencies, and verification status
+- unfinished backlog items with status, kind, objectiveRefs, evidenceRefs, and research dependencies
 - current item id
-- pending verification item id
-- pending verification requests and the latest verification reports
-- last verification summary
+- last cycle commit sha, last cycle summary, last cycle changed files, and last cycle no-op state
+- recent AutoDevelop commits from git history
+- next retry time if a no-op cycle is waiting
 - last failure or stop reason
 - the exact next step to take when the loop resumes${priorSummaryBlock}
 
@@ -1002,12 +1420,8 @@ ${researchArtifactSummary || "- none"}
 Research blockers:
 ${researchBlockers || "- none"}
 
-Verifier backend:
-- ${formatVerifierSummary(loopState)}
-${pendingVerification}
-
-Recent verification reports:
-${verificationReports || "- none"}
+Recent AutoDevelop commits:
+${recentCommits || "- none"}
 
 Conversation to summarize:
 <conversation>
@@ -1020,7 +1434,7 @@ Write markdown with these sections:
 ## Research
 ## Quality Objectives
 ## Backlog
-## Verification
+## Git Cycle
 ## Next Step
 ## Conversation Summary`;
 

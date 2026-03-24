@@ -1,14 +1,14 @@
-export const LOOP_STATE_VERSION = 4;
+export const LOOP_STATE_VERSION = 5;
 
-export const BACKLOG_KINDS = ["research", "code", "test", "verify"];
+export const BACKLOG_KINDS = ["research", "code", "test"];
 export const ITEM_STATUSES = ["pending", "in_progress", "done", "blocked"];
 
-export const LOOP_MODES = ["delivery", "hardening", "improvement"];
-export const LOOP_PHASES = ["planning", "researching", "implementing", "testing", "verifying", "reviewing", "paused", "blocked", "stopped"];
-export const LEGACY_LOOP_PHASES = new Set(["improving", "complete"]);
+export const LOOP_MODES = ["cycle"];
+export const LOOP_PHASES = ["planning", "researching", "implementing", "testing", "committing", "relaunching", "paused", "blocked", "stopped"];
+export const LEGACY_LOOP_PHASES = new Set(["improving", "complete", "verifying", "reviewing"]);
 
-export const ACTIVE_PHASES = new Set(["planning", "researching", "implementing", "testing", "verifying", "reviewing"]);
-export const READ_ONLY_PHASES = new Set(["planning", "researching", "verifying", "reviewing"]);
+export const ACTIVE_PHASES = new Set(["planning", "researching", "implementing", "testing", "committing", "relaunching"]);
+export const READ_ONLY_PHASES = new Set(["planning", "researching", "committing", "relaunching"]);
 export const EXECUTION_PHASES = new Set(["implementing", "testing"]);
 export const PAUSED_OR_TERMINAL_PHASES = new Set(["paused", "blocked", "stopped"]);
 
@@ -16,7 +16,6 @@ export const QUALITY_OBJECTIVE_NAMES = ["performance", "latency", "throughput", 
 export const QUALITY_OBJECTIVE_STATUSES = ["pending", "in_progress", "addressed", "not_applicable", "opted_out", "blocked"];
 export const RESOLVED_QUALITY_OBJECTIVE_STATUSES = new Set(["addressed", "not_applicable", "opted_out"]);
 export const QUALITY_HARDENING_PRIORITY = ["reliability", "scalability", "throughput", "latency", "memory", "performance"];
-export const IMPROVEMENT_DIRECTIONS = ["observability", "automation", "maintainability", "polish"];
 
 export const GOAL_SECTION_ORDER = [
 	"Goal",
@@ -31,8 +30,6 @@ export const LOOP_SKILL_COMMAND = "/skill:auto-develop-loop";
 
 export const RESEARCH_SCOPES = ["repo", "web", "auto"];
 export const RESEARCH_PROVIDER_NAMES = ["local", "searxng", "pinchtab"];
-export const VERIFICATION_STATUSES = ["pending", "running", "passed", "pass_with_notes", "failed"];
-export const VERIFIER_BACKENDS = ["pi_cli", "inline"];
 
 export const BUILT_IN_TOOL_NAMES = new Set([
 	"read",

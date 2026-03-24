@@ -1,7 +1,6 @@
 import {
 	ACTIVE_PHASES,
 	BACKLOG_KINDS,
-	IMPROVEMENT_DIRECTIONS,
 	ITEM_STATUSES,
 	LEGACY_LOOP_PHASES,
 	LOOP_MODES,
@@ -14,13 +13,11 @@ import {
 	RESEARCH_PROVIDER_NAMES,
 	RESEARCH_SCOPES,
 	RESOLVED_QUALITY_OBJECTIVE_STATUSES,
-	VERIFICATION_STATUSES,
-	VERIFIER_BACKENDS,
 } from "./constants.js";
 import { parseGoalDocument } from "./goal.js";
 
 function slugify(value, fallback) {
-	const slug = value
+	const slug = String(value ?? "")
 		.toLowerCase()
 		.replace(/[^a-z0-9]+/g, "-")
 		.replace(/^-+|-+$/g, "")
@@ -29,8 +26,16 @@ function slugify(value, fallback) {
 	return slug || fallback;
 }
 
+function trimText(value) {
+	return typeof value === "string" ? value.trim() : "";
+}
+
 function clone(value) {
 	return value ? JSON.parse(JSON.stringify(value)) : value;
+}
+
+function uniqueTrimmed(values) {
+	return [...new Set((values ?? []).map((value) => String(value).trim()).filter(Boolean))];
 }
 
 function assertValidKind(kind) {
@@ -75,18 +80,6 @@ function assertValidResearchScope(scope) {
 	}
 }
 
-function assertValidVerificationStatus(status) {
-	if (!VERIFICATION_STATUSES.includes(status)) {
-		throw new Error(`Invalid verification status: ${status}`);
-	}
-}
-
-function assertValidVerifierBackend(backend) {
-	if (!VERIFIER_BACKENDS.includes(backend)) {
-		throw new Error(`Invalid verifier backend: ${backend}`);
-	}
-}
-
 function phaseFromKind(kind) {
 	switch (kind) {
 		case "research":
@@ -95,15 +88,9 @@ function phaseFromKind(kind) {
 			return "implementing";
 		case "test":
 			return "testing";
-		case "verify":
-			return "verifying";
 		default:
 			return "planning";
 	}
-}
-
-function uniqueTrimmed(values) {
-	return [...new Set((values ?? []).map((value) => String(value).trim()).filter(Boolean))];
 }
 
 function normalizeGoalSnapshot(goalSnapshot) {
@@ -138,6 +125,25 @@ function normalizeEvidenceRefs(evidenceRefs) {
 
 function normalizeResearchDependencies(dependsOnResearchItemIds) {
 	return uniqueTrimmed(dependsOnResearchItemIds);
+}
+
+function normalizeCycleChangedFiles(files) {
+	return uniqueTrimmed(files);
+}
+
+function normalizeCycleBlockers(blockers) {
+	return uniqueTrimmed(blockers);
+}
+
+function normalizeCycleCommits(commits) {
+	return (commits ?? [])
+		.map((commit) => ({
+			sha: trimText(commit?.sha),
+			shortSha: trimText(commit?.shortSha),
+			subject: trimText(commit?.subject),
+			committedAt: trimText(commit?.committedAt),
+		}))
+		.filter((commit) => commit.sha || commit.subject);
 }
 
 export function createDefaultQualityObjectives(explicitOptOuts = []) {
@@ -176,7 +182,7 @@ function normalizeQualityObjectives(rawObjectives, explicitOptOuts) {
 		normalized[objective] = {
 			enabled: status === "opted_out" ? false : enabled,
 			status: enabled ? status : "opted_out",
-			evidence: raw.evidence?.trim() ?? defaults[objective].evidence,
+			evidence: trimText(raw.evidence) || defaults[objective].evidence,
 		};
 	}
 
@@ -219,42 +225,12 @@ function normalizeResearchProviders(rawProviders) {
 		normalized[name] = {
 			configured: Boolean(raw.configured ?? defaults[name].configured),
 			healthy: Boolean(raw.healthy ?? defaults[name].healthy),
-			description: raw.description?.trim?.() ?? defaults[name].description,
-			lastError: raw.lastError?.trim?.() ?? "",
-			lastCheckedAt: raw.lastCheckedAt?.trim?.() ?? "",
+			description: trimText(raw.description) || defaults[name].description,
+			lastError: trimText(raw.lastError),
+			lastCheckedAt: trimText(raw.lastCheckedAt),
 		};
 	}
 
-	return normalized;
-}
-
-export function createDefaultVerifierBackend() {
-	return {
-		configured: "auto",
-		resolved: "inline",
-		available: true,
-		degradedReason: "Verifier backend has not been probed yet. Using inline verifier mode by default.",
-		repoRoot: null,
-		isGitRepo: false,
-	};
-}
-
-function normalizeVerifierBackend(rawBackend) {
-	const defaults = createDefaultVerifierBackend();
-	const degradedReason =
-		rawBackend && Object.prototype.hasOwnProperty.call(rawBackend, "degradedReason")
-			? rawBackend.degradedReason?.trim?.() ?? ""
-			: defaults.degradedReason;
-	const normalized = {
-		configured: rawBackend?.configured?.trim?.() || defaults.configured,
-		resolved: rawBackend?.resolved?.trim?.() || defaults.resolved,
-		available: Boolean(rawBackend?.available ?? defaults.available),
-		degradedReason,
-		repoRoot: rawBackend?.repoRoot?.trim?.() ?? defaults.repoRoot,
-		isGitRepo: Boolean(rawBackend?.isGitRepo ?? defaults.isGitRepo),
-	};
-
-	assertValidVerifierBackend(normalized.resolved);
 	return normalized;
 }
 
@@ -265,21 +241,21 @@ function normalizeResearchArtifact(artifact, index = 0) {
 	assertValidResearchScope(scope);
 
 	return {
-		id: artifact.id?.trim() || `research-artifact-${index + 1}`,
-		createdAt: artifact.createdAt?.trim?.() ?? "",
-		action: artifact.action?.trim?.() || "query",
+		id: trimText(artifact.id) || `research-artifact-${index + 1}`,
+		createdAt: trimText(artifact.createdAt),
+		action: trimText(artifact.action) || "query",
 		scope,
-		provider: artifact.provider?.trim?.() || "local",
-		query: artifact.query?.trim?.() ?? "",
-		target: artifact.target?.trim?.() ?? "",
-		summary: artifact.summary?.trim?.() ?? "",
-		content: artifact.content?.trim?.() ?? "",
+		provider: trimText(artifact.provider) || "local",
+		query: trimText(artifact.query),
+		target: trimText(artifact.target),
+		summary: trimText(artifact.summary),
+		content: trimText(artifact.content),
 		sources: Array.isArray(artifact.sources)
 			? artifact.sources.map((source) => ({
-					kind: source.kind?.trim?.() || "url",
-					location: source.location?.trim?.() ?? "",
-					title: source.title?.trim?.() ?? "",
-					snippet: source.snippet?.trim?.() ?? "",
+					kind: trimText(source.kind) || "url",
+					location: trimText(source.location),
+					title: trimText(source.title),
+					snippet: trimText(source.snippet),
 					line: Number.isFinite(source.line) ? source.line : undefined,
 				}))
 			: [],
@@ -291,67 +267,162 @@ function normalizeResearchArtifacts(artifacts) {
 	return (artifacts ?? []).map((artifact, index) => normalizeResearchArtifact(artifact, index)).filter(Boolean);
 }
 
-function normalizeVerificationRequest(request, index = 0) {
-	if (!request) return null;
+function normalizeKind(kind) {
+	const normalized = trimText(kind).toLowerCase();
+	if (normalized === "verify") return "test";
+	return normalized;
+}
+
+function normalizeBacklogItem(item, index = 0) {
+	if (!item) return null;
+
+	const kind = normalizeKind(item.kind ?? "code");
+	assertValidKind(kind);
+
+	let status = trimText(item.status) || "pending";
+	if (item.verificationStatus === "running" || item.verificationStatus === "pending") {
+		status = "pending";
+	}
+	assertValidStatus(status);
 
 	return {
-		id: request.id?.trim() || `verify-request-${index + 1}`,
-		createdAt: request.createdAt?.trim?.() ?? "",
-		itemId: request.itemId?.trim?.() ?? "",
-		itemKind: request.itemKind?.trim?.() ?? "",
-		itemTitle: request.itemTitle?.trim?.() ?? "",
-		goal: clone(request.goal ?? {}),
-		item: {
-			id: request.item?.id?.trim?.() ?? request.itemId?.trim?.() ?? "",
-			kind: request.item?.kind?.trim?.() ?? request.itemKind?.trim?.() ?? "",
-			title: request.item?.title?.trim?.() ?? request.itemTitle?.trim?.() ?? "",
-			status: request.item?.status?.trim?.() ?? "",
-			notes: request.item?.notes?.trim?.() ?? "",
-			acceptanceCriteria: request.item?.acceptanceCriteria?.trim?.() ?? "",
-			objectiveRefs: normalizeObjectiveRefs(request.item?.objectiveRefs),
-			evidenceRefs: normalizeEvidenceRefs(request.item?.evidenceRefs),
-			dependsOnResearchItemIds: normalizeResearchDependencies(request.item?.dependsOnResearchItemIds),
-		},
-		linkedResearchArtifacts: normalizeResearchArtifacts(request.linkedResearchArtifacts),
-		repoSnapshot: clone(request.repoSnapshot ?? {}),
-		lastVerificationSummary: request.lastVerificationSummary?.trim?.() ?? "",
-		lastFailure: request.lastFailure?.trim?.() ?? "",
-		fingerprint: request.fingerprint?.trim?.() ?? "",
-		instructions: request.instructions?.trim?.() ?? "",
+		id: trimText(item.id) || `item-${index + 1}-${slugify(item.title ?? kind, kind)}`,
+		title: trimText(item.title) || `Untitled ${kind} task ${index + 1}`,
+		kind,
+		status,
+		notes: trimText(item.notes),
+		acceptanceCriteria: trimText(item.acceptanceCriteria),
+		objectiveRefs: normalizeObjectiveRefs(item.objectiveRefs),
+		researchRequired: Boolean(item.researchRequired),
+		evidenceRefs: normalizeEvidenceRefs(item.evidenceRefs),
+		dependsOnResearchItemIds: normalizeResearchDependencies(item.dependsOnResearchItemIds),
 	};
 }
 
-function normalizeVerificationRequests(requests) {
-	return (requests ?? []).map((request, index) => normalizeVerificationRequest(request, index)).filter(Boolean);
+function normalizeBacklog(backlog) {
+	return (backlog ?? []).map((item, index) => normalizeBacklogItem(item, index)).filter(Boolean);
 }
 
-function normalizeVerificationReport(report, index = 0) {
-	if (!report) return null;
+function findRunnableItem(backlog, currentItemId = null) {
+	const current = currentItemId
+		? backlog.find((item) => item.id === currentItemId && (item.status === "pending" || item.status === "in_progress"))
+		: null;
+	return current ?? backlog.find((item) => item.status === "in_progress") ?? backlog.find((item) => item.status === "pending") ?? null;
+}
 
-	const status = report.status?.trim?.() ?? "fail";
-	if (!["pass", "pass_with_notes", "fail"].includes(status)) {
-		throw new Error(`Invalid verification report status: ${status}`);
+function selectCurrentItemId(backlog) {
+	return findRunnableItem(backlog)?.id ?? null;
+}
+
+function derivePhase(backlog, currentItemId, currentPhase = "planning") {
+	if (["paused", "blocked", "stopped", "committing", "relaunching"].includes(currentPhase)) {
+		return currentPhase;
 	}
 
-	const failureKind = report.failureKind?.trim?.().toLowerCase?.() === "infrastructure" ? "infrastructure" : "task";
-
-	return {
-		id: report.id?.trim() || `verify-report-${index + 1}`,
-		requestId: report.requestId?.trim?.() ?? "",
-		requestFingerprint: report.requestFingerprint?.trim?.() ?? "",
-		createdAt: report.createdAt?.trim?.() ?? "",
-		status,
-		failureKind,
-		summary: report.summary?.trim?.() ?? "",
-		findings: uniqueTrimmed(report.findings),
-		missingEvidence: uniqueTrimmed(report.missingEvidence),
-		recommendedNextSteps: uniqueTrimmed(report.recommendedNextSteps),
-		rawText: report.rawText?.trim?.() ?? "",
-	};
+	const runnable = findRunnableItem(backlog, currentItemId);
+	if (runnable) return phaseFromKind(runnable.kind);
+	if (backlog.some((item) => item.status === "blocked")) return "blocked";
+	return "planning";
 }
 
-function normalizeVerificationReports(reports) {
-	return (reports ?? []).map((report, index) => normalizeVerificationReport(report, index)).filter(Boolean);
+function appendUniqueText(existing, nextLine) {
+	const next = trimText(nextLine);
+	if (!next) return trimText(existing);
+	const current = trimText(existing);
+	if (!current) return next;
+	if (current.includes(next)) return current;
+	return `${current}\n${next}`;
+}
+
+function createResearchItemFromUncertainty(params, item, backlog) {
+	const title = trimText(params.question) || `Research for ${item.title}`;
+	return normalizeBacklogItem(
+		{
+			id: trimText(params.newItemId) || `research-${backlog.length + 1}-${slugify(title, "research")}`,
+			title,
+			kind: "research",
+			status: "pending",
+			notes: trimText(params.reason),
+			objectiveRefs: normalizeObjectiveRefs(params.objectiveRefs ?? item.objectiveRefs),
+		},
+		backlog.length,
+	);
+}
+
+function unfinishedDependencyTitles(state, item) {
+	const blockers = [];
+	for (const dependencyId of item.dependsOnResearchItemIds ?? []) {
+		const dependency = state.backlog.find((candidate) => candidate.id === dependencyId);
+		if (dependency && dependency.status !== "done") {
+			blockers.push(dependency.title);
+		}
+	}
+	return blockers;
+}
+
+function validateCompletionRequirements(state, item) {
+	if (!item) {
+		throw new Error("Cannot complete an unknown backlog item.");
+	}
+
+	if (item.kind === "research" && item.evidenceRefs.length === 0) {
+		throw new Error(`Research item "${item.title}" requires evidenceRefs before it can be marked done.`);
+	}
+
+	if (item.researchRequired && item.evidenceRefs.length === 0) {
+		throw new Error(`Item "${item.title}" requires linked research evidence before it can be marked done.`);
+	}
+
+	const dependencyTitles = unfinishedDependencyTitles(state, item);
+	if (dependencyTitles.length) {
+		throw new Error(`Item "${item.title}" still depends on unfinished research: ${dependencyTitles.join(", ")}.`);
+	}
+}
+
+function normalizeMode(mode) {
+	if (trimText(mode) && LOOP_MODES.includes(trimText(mode))) {
+		return trimText(mode);
+	}
+	return "cycle";
+}
+
+function normalizePhase(phase) {
+	const normalized = trimText(phase).toLowerCase();
+	if (normalized === "verifying" || normalized === "reviewing") return "testing";
+	if (LEGACY_LOOP_PHASES.has(normalized)) return "planning";
+	if (LOOP_PHASES.includes(normalized)) return normalized;
+	return "planning";
+}
+
+export function createInitialLoopState(goalSnapshot, researchProviders = createDefaultResearchProviders(), repoContext = {}) {
+	const goal = normalizeGoalSnapshot(goalSnapshot);
+
+	return {
+		version: LOOP_STATE_VERSION,
+		mode: "cycle",
+		phase: "planning",
+		goal,
+		repoRoot: trimText(repoContext.repoRoot),
+		branch: trimText(repoContext.branch),
+		iteration: 0,
+		cycleNumber: Number.isFinite(repoContext.cycleNumber) && repoContext.cycleNumber > 0 ? repoContext.cycleNumber : 1,
+		lastCycleCommitSha: "",
+		lastCycleSummary: "",
+		lastCycleChangedFiles: [],
+		lastCycleNoop: false,
+		lastCycleBlockers: [],
+		nextCycleAt: "",
+		recentCycleCommits: normalizeCycleCommits(repoContext.recentCycleCommits),
+		goalSatisfied: false,
+		completionSummary: "",
+		currentItemId: null,
+		backlog: [],
+		qualityObjectives: normalizeQualityObjectives(undefined, goal.explicitOptOuts),
+		researchProviders: normalizeResearchProviders(researchProviders),
+		researchArtifacts: [],
+		lastFailure: "",
+		stopReason: "",
+	};
 }
 
 export function getUnresolvedQualityObjectives(state) {
@@ -367,649 +438,24 @@ export function allEnabledQualityObjectivesResolved(state) {
 	return getUnresolvedQualityObjectives(state).length === 0;
 }
 
-function getCurrentActiveItem(state) {
-	if (!state?.currentItemId) return null;
-
-	const item = state.backlog.find((candidate) => candidate.id === state.currentItemId);
-	if (!item || item.status === "done" || item.status === "blocked") return null;
-	return item;
-}
-
-function derivePhaseFromState(state) {
-	if (state?.pendingVerificationItemId) return "reviewing";
-
-	const currentItem = getCurrentActiveItem(state);
-	if (currentItem) return phaseFromKind(currentItem.kind);
-
-	const nextItem = state.backlog.find((candidate) => candidate.status === "in_progress" || candidate.status === "pending");
-	return nextItem ? phaseFromKind(nextItem.kind) : "planning";
-}
-
-function hasRunnableBacklogItem(state) {
-	return state?.backlog?.some((candidate) => candidate.status === "in_progress" || candidate.status === "pending");
-}
-
-function normalizeModeAndPhase(state) {
-	const nextState = cloneLoopState(state);
-
-	if (!nextState.goalSatisfied) {
-		nextState.mode = "delivery";
-	} else if (nextState.mode === "hardening" && allEnabledQualityObjectivesResolved(nextState)) {
-		nextState.mode = "improvement";
-	}
-
-	if (nextState.phase === "reviewing" && !nextState.pendingVerificationItemId) {
-		nextState.phase = derivePhaseFromState(nextState);
-	} else if (!LOOP_PHASES.includes(nextState.phase)) {
-		nextState.phase = derivePhaseFromState(nextState);
-	}
-
-	return nextState;
-}
-
-export function createInitialLoopState(
-	goalSnapshot,
-	researchProviders = createDefaultResearchProviders(),
-	verifierBackend = createDefaultVerifierBackend(),
-) {
-	const normalizedGoal = normalizeGoalSnapshot(goalSnapshot);
-
-	return {
-		version: LOOP_STATE_VERSION,
-		goal: normalizedGoal,
-		mode: "delivery",
-		phase: "planning",
-		goalSatisfied: false,
-		iteration: 0,
-		currentItemId: null,
-		backlog: [],
-		qualityObjectives: createDefaultQualityObjectives(normalizedGoal.explicitOptOuts),
-		researchArtifacts: [],
-		researchProviders: normalizeResearchProviders(researchProviders),
-		verifierBackend: normalizeVerifierBackend(verifierBackend),
-		verificationRequests: [],
-		verificationReports: [],
-		pendingVerificationItemId: null,
-		lastVerificationSummary: "",
-		lastFailure: "",
-		stopReason: "",
-		completionSummary: "",
-	};
-}
-
-export function normalizeBacklogItems(items) {
-	return (items ?? []).map((item, index) => {
-		const kind = item.kind ?? "research";
-		const status = item.status ?? "pending";
-		assertValidKind(kind);
-		assertValidStatus(status);
-
-		return {
-			id: item.id?.trim() || `item-${index + 1}-${slugify(item.title ?? kind, kind)}`,
-			title: (item.title ?? `${kind} task ${index + 1}`).trim(),
-			kind,
-			status,
-			notes: item.notes?.trim() ?? "",
-			acceptanceCriteria: item.acceptanceCriteria?.trim() ?? "",
-			objectiveRefs: normalizeObjectiveRefs(item.objectiveRefs),
-			researchRequired: Boolean(item.researchRequired),
-			evidenceRefs: normalizeEvidenceRefs(item.evidenceRefs),
-			dependsOnResearchItemIds: normalizeResearchDependencies(item.dependsOnResearchItemIds),
-			verificationRequired: true,
-			verificationStatus: item.verificationStatus?.trim?.() ?? "pending",
-			verificationRequestId: item.verificationRequestId?.trim?.() ?? "",
-			verificationReportId: item.verificationReportId?.trim?.() ?? "",
-		};
-	});
-}
-
-function normalizeBacklogItemVerification(item) {
-	assertValidVerificationStatus(item.verificationStatus);
-	return item;
-}
-
-function findBacklogItem(state, itemId) {
-	const item = state.backlog.find((candidate) => candidate.id === itemId);
-	if (!item) {
-		throw new Error(`Backlog item not found: ${itemId}`);
-	}
-	return item;
-}
-
-function hasPendingResearchDependencies(state, item) {
-	return item.dependsOnResearchItemIds.some((dependencyId) => {
-		const dependency = state.backlog.find((candidate) => candidate.id === dependencyId);
-		return dependency && dependency.status !== "done";
-	});
-}
-
-function validateCompletionRequirements(state, item) {
-	if (item.kind === "research" && item.evidenceRefs.length === 0) {
-		throw new Error(`Research item "${item.title}" requires at least one evidenceRef before it can be marked done.`);
-	}
-
-	if (item.kind !== "research" && item.researchRequired && item.evidenceRefs.length === 0) {
-		throw new Error(`Item "${item.title}" requires linked research evidence before it can be marked done.`);
-	}
-
-	if (hasPendingResearchDependencies(state, item)) {
-		throw new Error(`Item "${item.title}" still depends on unfinished research.`);
-	}
-
-	if (item.verificationRequired && !["passed", "pass_with_notes"].includes(item.verificationStatus)) {
-		throw new Error(`Item "${item.title}" requires request_verification and a passing verifier result before it can be marked done.`);
-	}
-}
-
-function validateVerificationRequirements(state, item) {
-	if (!item.acceptanceCriteria?.trim()) {
-		throw new Error(`Item "${item.title}" requires acceptanceCriteria before verification can be requested.`);
-	}
-
-	if (item.kind === "research" && item.evidenceRefs.length === 0) {
-		throw new Error(`Research item "${item.title}" requires evidenceRefs before verification can be requested.`);
-	}
-
-	if (item.kind !== "research" && item.researchRequired && item.evidenceRefs.length === 0) {
-		throw new Error(`Item "${item.title}" requires linked research evidence before verification can be requested.`);
-	}
-
-	if (hasPendingResearchDependencies(state, item)) {
-		throw new Error(`Item "${item.title}" still depends on unfinished research and cannot be verified yet.`);
-	}
-}
-
-function appendUniqueText(base, extra) {
-	const next = extra?.trim();
-	if (!next) return base?.trim?.() ?? "";
-	if (!base?.trim()) return next;
-	return base.includes(next) ? base.trim() : `${base.trim()}\n${next}`;
-}
-
-function ensureCurrentResearchItemUsesArtifact(state, artifactId) {
-	if (!state.currentItemId) return;
-	const item = state.backlog.find((candidate) => candidate.id === state.currentItemId);
-	if (!item) return;
-	if (item.kind !== "research" && !item.researchRequired) return;
-	if (!item.evidenceRefs.includes(artifactId)) {
-		item.evidenceRefs.push(artifactId);
-	}
-}
-
-function buildVerifierNotes(report) {
-	const lines = [];
-	if (report.failureKind === "infrastructure") {
-		lines.push("Verifier infrastructure failed before a review verdict was produced.");
-	}
-	if (report.summary) lines.push(`Verifier summary: ${report.summary}`);
-	if (report.findings?.length) lines.push(`Verifier findings:\n- ${report.findings.join("\n- ")}`);
-	if (report.missingEvidence?.length) lines.push(`Missing evidence:\n- ${report.missingEvidence.join("\n- ")}`);
-	if (report.recommendedNextSteps?.length) lines.push(`Recommended next steps:\n- ${report.recommendedNextSteps.join("\n- ")}`);
-	return lines.join("\n");
-}
-
-function findRunnableBacklogItemExcluding(state, excludedItemId) {
-	return (
-		state?.backlog?.find(
-			(candidate) => candidate.id !== excludedItemId && (candidate.status === "in_progress" || candidate.status === "pending"),
-		) ?? null
-	);
-}
-
-function insertResearchItemForReason(nextState, item, args = {}) {
-	const scope = args.scope ?? "auto";
-	assertValidResearchScope(scope);
-
-	item.status = "pending";
-	item.researchRequired = true;
-	item.objectiveRefs = normalizeObjectiveRefs([...(item.objectiveRefs ?? []), ...(args.objectiveRefs ?? [])]);
-	item.notes = appendUniqueText(item.notes, `Blocked on research: ${args.reason?.trim() || args.question?.trim() || "Unclear implementation detail."}`);
-
-	const researchTitle = args.question?.trim() || args.reason?.trim() || `Research needed for ${item.title}`;
-	const researchId = `research-${slugify(researchTitle, "follow-up")}-${nextState.backlog.length + 1}`;
-	const researchItem = normalizeBacklogItems([
-		{
-			id: researchId,
-			title: `Research: ${researchTitle}`,
-			kind: "research",
-			status: "in_progress",
-			notes: [args.reason?.trim(), args.question?.trim(), `Scope: ${scope}`].filter(Boolean).join("\n"),
-			acceptanceCriteria: `Capture evidenceRefs that unblock "${item.title}".`,
-			objectiveRefs: normalizeObjectiveRefs([...(args.objectiveRefs ?? []), ...(item.objectiveRefs ?? [])]),
-			researchRequired: false,
-			evidenceRefs: [],
-			dependsOnResearchItemIds: [],
-		},
-	])[0];
-
-	if (!item.dependsOnResearchItemIds.includes(researchId)) {
-		item.dependsOnResearchItemIds.push(researchId);
-	}
-
-	const targetIndex = nextState.backlog.findIndex((candidate) => candidate.id === item.id);
-	nextState.backlog.splice(targetIndex >= 0 ? targetIndex : nextState.backlog.length, 0, researchItem);
-	nextState.currentItemId = researchId;
-	nextState.phase = "researching";
-	nextState.lastFailure = args.reason?.trim?.() ?? "";
-	nextState.stopReason = "";
-	return researchItem;
-}
-
-function verificationStatusFromReport(reportStatus) {
-	switch (reportStatus) {
-		case "pass":
-			return "passed";
-		case "pass_with_notes":
-			return "pass_with_notes";
-		case "fail":
-		default:
-			return "failed";
-	}
-}
-
 export function getUnresolvedResearchBlockers(state) {
-	if (!state?.backlog) return [];
+	if (!state?.backlog?.length) return [];
 
-	return state.backlog.filter((item) => {
-		if (item.kind === "research") {
-			return item.status !== "done";
+	const blockers = [];
+	for (const item of state.backlog) {
+		if (item.kind === "research" && item.status !== "done") {
+			blockers.push(item);
+			continue;
 		}
-
-		return item.researchRequired && (item.evidenceRefs.length === 0 || hasPendingResearchDependencies(state, item));
-	});
+		if (item.researchRequired && item.status !== "done" && item.evidenceRefs.length === 0) {
+			blockers.push(item);
+		}
+	}
+	return blockers;
 }
 
-export function getRecentResearchArtifacts(state, limit = 5) {
-	if (!state?.researchArtifacts?.length) return [];
-	return state.researchArtifacts.slice(-limit).reverse();
-}
-
-export function applyStateAction(state, action, params = {}) {
-	const nextState = cloneLoopState(state);
-	if (!nextState) {
-		throw new Error("Loop state is not initialized");
-	}
-
-	switch (action) {
-		case "get":
-			return nextState;
-
-		case "replace_plan": {
-			nextState.backlog = normalizeBacklogItems(params.items ?? []).map(normalizeBacklogItemVerification);
-			const inProgressItem = nextState.backlog.find((item) => item.status === "in_progress");
-			nextState.currentItemId = inProgressItem?.id ?? nextState.currentItemId ?? null;
-			nextState.pendingVerificationItemId = null;
-			nextState.stopReason = "";
-			if (!nextState.goalSatisfied) {
-				nextState.completionSummary = "";
-			}
-			nextState.phase = inProgressItem ? phaseFromKind(inProgressItem.kind) : derivePhaseFromState(nextState);
-			return normalizeModeAndPhase(nextState);
-		}
-
-		case "update_item": {
-			if (!params.itemId) {
-				throw new Error("itemId is required for update_item");
-			}
-
-			const item = findBacklogItem(nextState, params.itemId);
-			const patch = params.patch ?? {};
-
-			if (patch.kind !== undefined) {
-				assertValidKind(patch.kind);
-				item.kind = patch.kind;
-			}
-
-			if (patch.title !== undefined) item.title = patch.title.trim();
-			if (patch.notes !== undefined) item.notes = patch.notes.trim();
-			if (patch.acceptanceCriteria !== undefined) item.acceptanceCriteria = patch.acceptanceCriteria.trim();
-			if (patch.objectiveRefs !== undefined) item.objectiveRefs = normalizeObjectiveRefs(patch.objectiveRefs);
-			if (patch.researchRequired !== undefined) item.researchRequired = Boolean(patch.researchRequired);
-			if (patch.evidenceRefs !== undefined) item.evidenceRefs = normalizeEvidenceRefs(patch.evidenceRefs);
-			if (patch.dependsOnResearchItemIds !== undefined) {
-				item.dependsOnResearchItemIds = normalizeResearchDependencies(patch.dependsOnResearchItemIds);
-			}
-
-			if (patch.status !== undefined) {
-				assertValidStatus(patch.status);
-				if (patch.status === "done") {
-					validateCompletionRequirements(nextState, item);
-				}
-				item.status = patch.status;
-			}
-
-			if (item.status === "in_progress") {
-				nextState.currentItemId = item.id;
-				nextState.phase = phaseFromKind(item.kind);
-			}
-
-			if ((item.status === "done" || item.status === "blocked") && nextState.currentItemId === item.id) {
-				nextState.currentItemId = null;
-				if (nextState.pendingVerificationItemId === item.id) {
-					nextState.pendingVerificationItemId = null;
-				}
-				nextState.phase = derivePhaseFromState(nextState);
-			}
-
-			return normalizeModeAndPhase(nextState);
-		}
-
-		case "set_phase": {
-			if (!params.phase) {
-				throw new Error("phase is required for set_phase");
-			}
-			assertValidPhase(params.phase);
-
-			nextState.phase = params.phase;
-			if (params.currentItemId !== undefined) {
-				nextState.currentItemId = params.currentItemId || null;
-			}
-			if (params.verificationSummary !== undefined) {
-				nextState.lastVerificationSummary = params.verificationSummary.trim();
-			}
-			if (params.failure !== undefined) {
-				nextState.lastFailure = params.failure.trim();
-			}
-			if (PAUSED_OR_TERMINAL_PHASES.has(nextState.phase) && params.failure) {
-				nextState.stopReason = params.failure.trim();
-			}
-			return normalizeModeAndPhase(nextState);
-		}
-
-		case "request_verification": {
-			if (!params.itemId) {
-				throw new Error("itemId is required for request_verification");
-			}
-
-			if (nextState.pendingVerificationItemId && nextState.pendingVerificationItemId !== params.itemId) {
-				throw new Error(`Another item is already pending verification: ${nextState.pendingVerificationItemId}`);
-			}
-
-			const item = findBacklogItem(nextState, params.itemId);
-			validateVerificationRequirements(nextState, item);
-
-			if (item.status === "pending") {
-				item.status = "in_progress";
-			}
-
-			item.verificationStatus = "running";
-			item.verificationRequestId = params.requestId?.trim?.() ?? item.verificationRequestId ?? "";
-			item.verificationReportId = "";
-			nextState.pendingVerificationItemId = item.id;
-			nextState.currentItemId = item.id;
-			nextState.phase = "reviewing";
-			nextState.stopReason = "";
-			return normalizeModeAndPhase(nextState);
-		}
-
-		case "record_verification_request": {
-			const request = normalizeVerificationRequest(params.request, nextState.verificationRequests.length);
-			if (!request) {
-				throw new Error("request is required for record_verification_request");
-			}
-
-			const item = findBacklogItem(nextState, request.itemId);
-			const existingIndex = nextState.verificationRequests.findIndex((candidate) => candidate.id === request.id);
-			if (existingIndex >= 0) {
-				nextState.verificationRequests[existingIndex] = request;
-			} else {
-				nextState.verificationRequests.push(request);
-			}
-
-			item.verificationStatus = "running";
-			item.verificationRequestId = request.id;
-			item.verificationReportId = "";
-			nextState.pendingVerificationItemId = item.id;
-			nextState.currentItemId = item.id;
-			nextState.phase = "reviewing";
-			return normalizeModeAndPhase(nextState);
-		}
-
-		case "discard_verification_request": {
-			if (!params.requestId) {
-				throw new Error("requestId is required for discard_verification_request");
-			}
-
-			const request = nextState.verificationRequests.find((candidate) => candidate.id === params.requestId);
-			if (!request) {
-				throw new Error(`Verification request not found: ${params.requestId}`);
-			}
-
-			const item = findBacklogItem(nextState, request.itemId);
-			item.verificationStatus = "pending";
-			item.notes = appendUniqueText(
-				item.notes,
-				params.reason?.trim?.() || `Discarded stale verifier result for request ${params.requestId}.`,
-			);
-			nextState.pendingVerificationItemId = null;
-			nextState.currentItemId = item.id;
-			nextState.phase = phaseFromKind(item.kind);
-			return normalizeModeAndPhase(nextState);
-		}
-
-		case "apply_verification_report": {
-			const report = normalizeVerificationReport(params.report, nextState.verificationReports.length);
-			if (!report) {
-				throw new Error("report is required for apply_verification_report");
-			}
-
-			const request = nextState.verificationRequests.find((candidate) => candidate.id === report.requestId);
-			if (!request) {
-				throw new Error(`Verification request not found for report: ${report.requestId}`);
-			}
-
-			const item = findBacklogItem(nextState, request.itemId);
-			const existingIndex = nextState.verificationReports.findIndex((candidate) => candidate.id === report.id);
-			if (existingIndex >= 0) {
-				nextState.verificationReports[existingIndex] = report;
-			} else {
-				nextState.verificationReports.push(report);
-			}
-
-			const verifierNotes = buildVerifierNotes(report);
-			item.verificationStatus =
-				report.failureKind === "infrastructure" ? "pending" : verificationStatusFromReport(report.status);
-			item.verificationReportId = report.id;
-			nextState.pendingVerificationItemId = null;
-			nextState.lastVerificationSummary = report.summary || nextState.lastVerificationSummary;
-
-			if (report.status === "pass" || report.status === "pass_with_notes") {
-				if (verifierNotes) {
-					item.notes = appendUniqueText(item.notes, verifierNotes);
-				}
-				item.status = "done";
-				nextState.currentItemId = null;
-				nextState.phase = derivePhaseFromState(nextState);
-				nextState.lastFailure = "";
-				nextState.stopReason = "";
-				return normalizeModeAndPhase(nextState);
-			}
-
-			if (report.failureKind === "infrastructure") {
-				if (verifierNotes) {
-					item.notes = appendUniqueText(item.notes, verifierNotes);
-				}
-				item.status = "pending";
-				nextState.lastFailure = report.summary || verifierNotes || "Verifier infrastructure failed.";
-				const alternateItem = findRunnableBacklogItemExcluding(nextState, item.id);
-				if (alternateItem) {
-					nextState.currentItemId = alternateItem.id;
-					nextState.phase = phaseFromKind(alternateItem.kind);
-					nextState.stopReason = "";
-				} else {
-					nextState.currentItemId = item.id;
-					nextState.phase = "blocked";
-					nextState.stopReason = nextState.lastFailure;
-				}
-				return normalizeModeAndPhase(nextState);
-			}
-
-			item.status = "pending";
-			if (verifierNotes) {
-				item.notes = appendUniqueText(item.notes, verifierNotes);
-			}
-			if (report.missingEvidence?.length && item.kind !== "research") {
-				insertResearchItemForReason(nextState, item, {
-					reason: `Verifier requested missing evidence for "${item.title}".`,
-					question: report.missingEvidence.join("; "),
-					scope: "auto",
-					objectiveRefs: item.objectiveRefs,
-				});
-			} else {
-				nextState.currentItemId = item.id;
-				nextState.phase = phaseFromKind(item.kind);
-			}
-			nextState.lastFailure = report.summary || verifierNotes || "Verification failed.";
-			return normalizeModeAndPhase(nextState);
-		}
-
-		case "update_objective": {
-			if (!params.objective) {
-				throw new Error("objective is required for update_objective");
-			}
-			if (!params.status) {
-				throw new Error("status is required for update_objective");
-			}
-
-			assertValidObjectiveName(params.objective);
-			assertValidObjectiveStatus(params.status);
-
-			const objective = nextState.qualityObjectives[params.objective];
-			if (!objective) {
-				throw new Error(`Unknown quality objective: ${params.objective}`);
-			}
-
-			if (!objective.enabled && params.status !== "opted_out") {
-				throw new Error(`Objective "${params.objective}" is opted out in the goal file and cannot be re-enabled here.`);
-			}
-			if (objective.enabled && params.status === "opted_out") {
-				throw new Error(`Objective "${params.objective}" can only be opted out in the goal file.`);
-			}
-
-			objective.status = params.status;
-			if (params.evidence !== undefined) {
-				objective.evidence = params.evidence.trim();
-			}
-
-			if (
-				nextState.goalSatisfied &&
-				nextState.mode === "improvement" &&
-				objective.enabled &&
-				!RESOLVED_QUALITY_OBJECTIVE_STATUSES.has(objective.status)
-			) {
-				nextState.mode = "hardening";
-			}
-
-			return normalizeModeAndPhase(nextState);
-		}
-
-		case "flag_uncertainty": {
-			if (!params.itemId) {
-				throw new Error("itemId is required for flag_uncertainty");
-			}
-
-			const item = findBacklogItem(nextState, params.itemId);
-			if (item.kind === "research") {
-				throw new Error("flag_uncertainty cannot target a research item");
-			}
-
-			insertResearchItemForReason(nextState, item, {
-				reason: params.reason,
-				question: params.question,
-				scope: params.scope ?? "auto",
-				objectiveRefs: params.objectiveRefs,
-			});
-			return normalizeModeAndPhase(nextState);
-		}
-
-		case "record_research_artifact": {
-			const artifact = normalizeResearchArtifact(params.artifact, nextState.researchArtifacts.length);
-			if (!artifact) {
-				throw new Error("artifact is required for record_research_artifact");
-			}
-
-			const existingIndex = nextState.researchArtifacts.findIndex((candidate) => candidate.id === artifact.id);
-			if (existingIndex >= 0) {
-				nextState.researchArtifacts[existingIndex] = artifact;
-			} else {
-				nextState.researchArtifacts.push(artifact);
-			}
-			ensureCurrentResearchItemUsesArtifact(nextState, artifact.id);
-			return normalizeModeAndPhase(nextState);
-		}
-
-		case "sync_research_providers": {
-			nextState.researchProviders = normalizeResearchProviders(params.providers);
-			return normalizeModeAndPhase(nextState);
-		}
-
-		case "sync_verifier_backend": {
-			nextState.verifierBackend = normalizeVerifierBackend(params.backend);
-			return normalizeModeAndPhase(nextState);
-		}
-
-		case "block": {
-			const reason = params.reason?.trim();
-			if (!reason) {
-				throw new Error("reason is required for block");
-			}
-
-			nextState.lastFailure = reason;
-			const targetItemId = params.itemId?.trim?.() || nextState.currentItemId;
-			if (targetItemId) {
-				const item = nextState.backlog.find((candidate) => candidate.id === targetItemId);
-				if (item) {
-					item.status = "blocked";
-					item.notes = appendUniqueText(item.notes, `Blocked: ${reason}`);
-				}
-				if (nextState.currentItemId === targetItemId) {
-					nextState.currentItemId = null;
-				}
-				if (nextState.pendingVerificationItemId === targetItemId) {
-					nextState.pendingVerificationItemId = null;
-				}
-			}
-
-			if (hasRunnableBacklogItem(nextState)) {
-				nextState.phase = derivePhaseFromState(nextState);
-				nextState.stopReason = "";
-			} else {
-				nextState.phase = "blocked";
-				nextState.stopReason = reason;
-			}
-			return normalizeModeAndPhase(nextState);
-		}
-
-		case "complete": {
-			const summary = params.summary?.trim() ?? "";
-			const previousMode = nextState.mode;
-
-			nextState.goalSatisfied = true;
-			nextState.stopReason = "";
-			nextState.completionSummary = summary;
-			if (summary) {
-				nextState.lastVerificationSummary = summary;
-			}
-			if (nextState.currentItemId) {
-				const item = nextState.backlog.find((candidate) => candidate.id === nextState.currentItemId);
-				if (item && item.status !== "blocked" && item.status !== "done") {
-					throw new Error(`Current item "${item.title}" must be completed and verifier-approved before calling complete.`);
-				}
-			}
-			nextState.currentItemId = null;
-			nextState.pendingVerificationItemId = null;
-			nextState.phase = "planning";
-			if (previousMode === "delivery") {
-				nextState.mode = "hardening";
-				return nextState;
-			}
-
-			return normalizeModeAndPhase(nextState);
-		}
-
-		default:
-			throw new Error(`Unsupported autodevelop_state action: ${action}`);
-	}
+export function getRecentResearchArtifacts(state, count = 5) {
+	return (state?.researchArtifacts ?? []).slice(Math.max(0, (state?.researchArtifacts?.length ?? 0) - count));
 }
 
 export function isLoopRunning(state) {
@@ -1018,321 +464,425 @@ export function isLoopRunning(state) {
 
 export function nextRunnablePhase(state) {
 	if (!state) return "planning";
-	return derivePhaseFromState(state);
+	if (PAUSED_OR_TERMINAL_PHASES.has(state.phase)) return state.phase;
+	return derivePhase(state.backlog ?? [], state.currentItemId, state.phase);
+}
+
+export function applyStateAction(state, action, params = {}) {
+	const nextState = migrateLoopState(state);
+	if (!nextState) {
+		throw new Error("Loop state is missing or invalid.");
+	}
+
+	switch (action) {
+		case "get":
+			return nextState;
+
+		case "replace_plan": {
+			const items = Array.isArray(params.items) ? params.items : [];
+			nextState.backlog = normalizeBacklog(items);
+			nextState.currentItemId = selectCurrentItemId(nextState.backlog);
+			nextState.phase = derivePhase(nextState.backlog, nextState.currentItemId, "planning");
+			nextState.stopReason = "";
+			if (nextState.phase !== "blocked") {
+				nextState.lastFailure = "";
+			}
+			return nextState;
+		}
+
+		case "update_item": {
+			const itemId = trimText(params.itemId);
+			if (!itemId) {
+				throw new Error("itemId is required for update_item");
+			}
+
+			const index = nextState.backlog.findIndex((item) => item.id === itemId);
+			if (index === -1) {
+				throw new Error(`Unknown backlog item: ${itemId}`);
+			}
+
+			const existing = nextState.backlog[index];
+			const patch = params.patch ?? {};
+			const merged = normalizeBacklogItem(
+				{
+					...existing,
+					...patch,
+				},
+				index,
+			);
+			if (!merged) {
+				throw new Error(`Failed to normalize backlog item: ${itemId}`);
+			}
+			if (merged.status === "done") {
+				validateCompletionRequirements(nextState, merged);
+			}
+
+			nextState.backlog[index] = merged;
+			nextState.currentItemId = selectCurrentItemId(nextState.backlog);
+			nextState.phase = derivePhase(nextState.backlog, nextState.currentItemId, nextState.phase);
+			nextState.stopReason = "";
+			if (merged.status !== "blocked" && nextState.phase !== "blocked") {
+				nextState.lastFailure = "";
+			}
+			return nextState;
+		}
+
+		case "set_phase": {
+			const phase = normalizePhase(params.phase);
+			assertValidPhase(phase);
+			nextState.phase = phase;
+
+			if (params.currentItemId !== undefined) {
+				const requestedId = trimText(params.currentItemId);
+				nextState.currentItemId = requestedId && nextState.backlog.some((item) => item.id === requestedId) ? requestedId : selectCurrentItemId(nextState.backlog);
+			} else if (!PAUSED_OR_TERMINAL_PHASES.has(phase) && phase !== "committing" && phase !== "relaunching") {
+				nextState.currentItemId = selectCurrentItemId(nextState.backlog);
+			}
+
+			if (params.failure !== undefined) {
+				nextState.lastFailure = trimText(params.failure);
+			}
+			if (phase !== "blocked") {
+				nextState.stopReason = "";
+			}
+			return nextState;
+		}
+
+		case "update_objective": {
+			const objective = trimText(params.objective).toLowerCase();
+			const status = trimText(params.status).toLowerCase();
+			assertValidObjectiveName(objective);
+			assertValidObjectiveStatus(status);
+			nextState.qualityObjectives[objective] = {
+				enabled: status === "opted_out" ? false : true,
+				status,
+				evidence: trimText(params.evidence) || trimText(nextState.qualityObjectives[objective]?.evidence),
+			};
+			return nextState;
+		}
+
+		case "flag_uncertainty": {
+			const itemId = trimText(params.itemId);
+			if (!itemId) {
+				throw new Error("itemId is required for flag_uncertainty");
+			}
+
+			const item = nextState.backlog.find((candidate) => candidate.id === itemId);
+			if (!item) {
+				throw new Error(`Unknown backlog item: ${itemId}`);
+			}
+
+			item.status = "blocked";
+			item.notes = appendUniqueText(item.notes, trimText(params.reason));
+
+			const researchItem = createResearchItemFromUncertainty(params, item, nextState.backlog);
+			nextState.backlog.push(researchItem);
+			nextState.currentItemId = selectCurrentItemId(nextState.backlog);
+			nextState.phase = derivePhase(nextState.backlog, nextState.currentItemId, "planning");
+			nextState.lastFailure = trimText(params.reason) || nextState.lastFailure;
+			nextState.stopReason = "";
+			return nextState;
+		}
+
+		case "block": {
+			const reason = trimText(params.reason);
+			if (!reason) {
+				throw new Error("reason is required for block");
+			}
+
+			const activeItem = nextState.backlog.find((item) => item.id === nextState.currentItemId && item.status === "in_progress");
+			const alternativeWork = nextState.backlog.some(
+				(item) => item.id !== activeItem?.id && (item.status === "pending" || item.status === "in_progress"),
+			);
+
+			if (activeItem && alternativeWork) {
+				activeItem.status = "blocked";
+				activeItem.notes = appendUniqueText(activeItem.notes, reason);
+				nextState.currentItemId = selectCurrentItemId(nextState.backlog);
+				nextState.phase = derivePhase(nextState.backlog, nextState.currentItemId, "planning");
+				nextState.lastFailure = reason;
+				nextState.stopReason = "";
+				return nextState;
+			}
+
+			nextState.phase = "blocked";
+			nextState.stopReason = reason;
+			nextState.lastFailure = reason;
+			nextState.currentItemId = selectCurrentItemId(nextState.backlog);
+			return nextState;
+		}
+
+		case "complete": {
+			const summary = trimText(params.summary);
+			if (!summary) {
+				throw new Error("summary is required for complete");
+			}
+			if (nextState.backlog.some((item) => item.status === "pending" || item.status === "in_progress")) {
+				throw new Error("Cannot complete the cycle while pending or in-progress backlog items remain.");
+			}
+			if (!nextState.backlog.some((item) => item.status === "done")) {
+				throw new Error("Cannot complete the cycle before at least one backlog item is done.");
+			}
+
+			nextState.goalSatisfied = true;
+			nextState.completionSummary = summary;
+			nextState.phase = "committing";
+			nextState.currentItemId = null;
+			nextState.lastFailure = "";
+			nextState.stopReason = "";
+			return nextState;
+		}
+
+		case "sync_research_providers": {
+			nextState.researchProviders = normalizeResearchProviders(params.providers);
+			return nextState;
+		}
+
+		case "record_research_artifact": {
+			const artifact = normalizeResearchArtifact(params.artifact, nextState.researchArtifacts.length);
+			if (!artifact) {
+				throw new Error("artifact is required for record_research_artifact");
+			}
+			const existingIndex = nextState.researchArtifacts.findIndex((candidate) => candidate.id === artifact.id);
+			if (existingIndex >= 0) {
+				nextState.researchArtifacts[existingIndex] = artifact;
+			} else {
+				nextState.researchArtifacts.push(artifact);
+			}
+			return nextState;
+		}
+
+		case "sync_git_context": {
+			nextState.repoRoot = trimText(params.repoRoot) || nextState.repoRoot;
+			nextState.branch = trimText(params.branch) || nextState.branch;
+			if (params.recentCycleCommits !== undefined) {
+				nextState.recentCycleCommits = normalizeCycleCommits(params.recentCycleCommits);
+			}
+			return nextState;
+		}
+
+		case "record_cycle_result": {
+			nextState.lastCycleCommitSha = trimText(params.commitSha);
+			nextState.lastCycleSummary = trimText(params.summary);
+			nextState.lastCycleChangedFiles = normalizeCycleChangedFiles(params.changedFiles);
+			nextState.lastCycleNoop = Boolean(params.noop);
+			nextState.lastCycleBlockers = normalizeCycleBlockers(params.blockers);
+			nextState.nextCycleAt = trimText(params.nextCycleAt);
+			if (params.recentCycleCommits !== undefined) {
+				nextState.recentCycleCommits = normalizeCycleCommits(params.recentCycleCommits);
+			}
+			return nextState;
+		}
+
+		case "begin_next_cycle": {
+			nextState.cycleNumber = Math.max(1, Number(nextState.cycleNumber || 1)) + 1;
+			nextState.phase = trimText(params.nextCycleAt) ? "relaunching" : "planning";
+			nextState.currentItemId = null;
+			nextState.backlog = [];
+			nextState.goalSatisfied = false;
+			nextState.completionSummary = "";
+			nextState.lastFailure = "";
+			nextState.stopReason = "";
+			nextState.iteration = 0;
+			nextState.nextCycleAt = trimText(params.nextCycleAt);
+			if (params.recentCycleCommits !== undefined) {
+				nextState.recentCycleCommits = normalizeCycleCommits(params.recentCycleCommits);
+			}
+			return nextState;
+		}
+
+		default:
+			throw new Error(`Unsupported state action: ${action}`);
+	}
+}
+
+export function migrateLoopState(state) {
+	if (!state) return null;
+
+	const goal = normalizeGoalSnapshot(state.goal);
+	const backlog = normalizeBacklog(state.backlog);
+	const currentItemId = trimText(state.currentItemId);
+	const currentId = currentItemId && backlog.some((item) => item.id === currentItemId) ? currentItemId : selectCurrentItemId(backlog);
+
+	const nextState = {
+		version: LOOP_STATE_VERSION,
+		mode: normalizeMode(state.mode),
+		phase: normalizePhase(state.phase),
+		goal,
+		repoRoot: trimText(state.repoRoot) || trimText(state.verifierBackend?.repoRoot),
+		branch: trimText(state.branch),
+		iteration: Number.isFinite(state.iteration) ? state.iteration : 0,
+		cycleNumber: Number.isFinite(state.cycleNumber) && state.cycleNumber > 0 ? state.cycleNumber : 1,
+		lastCycleCommitSha: trimText(state.lastCycleCommitSha),
+		lastCycleSummary: trimText(state.lastCycleSummary || state.completionSummary),
+		lastCycleChangedFiles: normalizeCycleChangedFiles(state.lastCycleChangedFiles),
+		lastCycleNoop: Boolean(state.lastCycleNoop),
+		lastCycleBlockers: normalizeCycleBlockers(state.lastCycleBlockers),
+		nextCycleAt: trimText(state.nextCycleAt),
+		recentCycleCommits: normalizeCycleCommits(state.recentCycleCommits),
+		goalSatisfied: Boolean(state.goalSatisfied),
+		completionSummary: trimText(state.completionSummary),
+		currentItemId: currentId,
+		backlog,
+		qualityObjectives: normalizeQualityObjectives(state.qualityObjectives, goal.explicitOptOuts),
+		researchProviders: normalizeResearchProviders(state.researchProviders),
+		researchArtifacts: normalizeResearchArtifacts(state.researchArtifacts),
+		lastFailure: trimText(state.lastFailure),
+		stopReason: trimText(state.stopReason),
+	};
+
+	assertValidMode(nextState.mode);
+	if (!PAUSED_OR_TERMINAL_PHASES.has(nextState.phase) && nextState.phase !== "committing" && nextState.phase !== "relaunching") {
+		nextState.phase = derivePhase(nextState.backlog, nextState.currentItemId, nextState.phase);
+	}
+	assertValidPhase(nextState.phase);
+	return nextState;
+}
+
+export function reconstructStateFromEntries(entries = []) {
+	for (let index = entries.length - 1; index >= 0; index -= 1) {
+		const entry = entries[index];
+		if (entry?.type === "custom" && entry.customType === "autodevelop-control" && entry.data?.state) {
+			return migrateLoopState(entry.data.state);
+		}
+
+		if (entry?.type !== "message") continue;
+		const details = entry.message?.details;
+		const candidate = details?.loopState ?? details?.state ?? details;
+		if (candidate?.goal?.path) {
+			return migrateLoopState(candidate);
+		}
+	}
+
+	return null;
+}
+
+function formatBacklogLine(item, state) {
+	const refs = item.objectiveRefs?.length ? ` -> ${item.objectiveRefs.join(",")}` : "";
+	const evidence = item.evidenceRefs?.length ? ` evidence:${item.evidenceRefs.join(",")}` : "";
+	const blockers = item.dependsOnResearchItemIds?.length ? ` deps:${item.dependsOnResearchItemIds.join(",")}` : "";
+	const required = item.researchRequired ? " research:required" : "";
+	const currentSuffix = item.id === state.currentItemId ? " current" : "";
+	return `- [${item.status}] [${item.kind}] ${item.title} (${item.id})${refs}${evidence}${blockers}${required}${currentSuffix}`;
 }
 
 export function formatLoopStateMarkdown(state) {
 	if (!state) {
-		return "## AutoDevelop\n\nNo loop state is active.";
+		return "## AutoDevelop\n\nNo loop state is available.";
 	}
 
-	const backlogLines =
-		state.backlog.length === 0
-			? ["- No backlog items yet."]
-			: state.backlog.map((item) => {
-					const refs = item.objectiveRefs?.length ? ` -> ${item.objectiveRefs.join(", ")}` : "";
-					const evidence = item.evidenceRefs?.length ? ` evidence:${item.evidenceRefs.join(",")}` : "";
-					const dependencySuffix = item.dependsOnResearchItemIds?.length
-						? ` depends:${item.dependsOnResearchItemIds.join(",")}`
-						: "";
-					const required = item.researchRequired ? " research-required" : "";
-					const verification = item.verificationRequired
-						? ` verify:${item.verificationStatus}${item.verificationRequestId ? ` req:${item.verificationRequestId}` : ""}${item.verificationReportId ? ` rep:${item.verificationReportId}` : ""}`
-						: " verify:disabled";
-					return `- [${item.status}] [${item.kind}] ${item.title} (\`${item.id}\`)${refs}${evidence}${dependencySuffix}${required}${verification}`;
-				});
-
+	const unresolvedObjectives = getUnresolvedQualityObjectives(state);
+	const recentResearch = getRecentResearchArtifacts(state, 5);
+	const recentCommits = state.recentCycleCommits?.length
+		? state.recentCycleCommits.map((commit) => `- ${commit.shortSha || commit.sha.slice(0, 12)} ${commit.subject}`).join("\n")
+		: "- none";
+	const backlogLines = state.backlog.length ? state.backlog.map((item) => formatBacklogLine(item, state)).join("\n") : "- none";
 	const objectiveLines = QUALITY_HARDENING_PRIORITY.map((objective) => {
 		const current = state.qualityObjectives?.[objective];
-		if (!current) return `- ${objective}: missing`;
-		const suffix = current.evidence ? ` - ${current.evidence}` : "";
-		return `- ${objective}: [${current.status}]${suffix}`;
-	});
+		return `- ${objective}: ${current?.status ?? "unknown"}${current?.evidence ? ` (${current.evidence})` : ""}`;
+	}).join("\n");
+	const researchLines = recentResearch.length
+		? recentResearch.map((artifact) => `- ${artifact.id} [${artifact.provider}] ${artifact.summary || artifact.query || artifact.target || "No summary."}`).join("\n")
+		: "- none";
 
-	const providerLines = RESEARCH_PROVIDER_NAMES.map((provider) => {
-		const current = state.researchProviders?.[provider];
-		if (!current) return `- ${provider}: missing`;
-		const status = current.healthy ? "healthy" : current.configured ? "degraded" : "unconfigured";
-		const errorSuffix = current.lastError ? ` - ${current.lastError}` : "";
-		return `- ${provider}: [${status}] ${current.description}${errorSuffix}`;
-	});
+	return `## AutoDevelop
 
-	const recentArtifacts = getRecentResearchArtifacts(state, 3);
-	const artifactLines = recentArtifacts.length
-		? recentArtifacts.map((artifact) => `- \`${artifact.id}\` [${artifact.provider}] ${artifact.summary || artifact.query || artifact.target}`)
-		: ["- No research artifacts yet."];
-	const recentReports = state.verificationReports?.slice(-3).reverse() ?? [];
-	const reportLines = recentReports.length
-		? recentReports.map((report) => {
-				const kindSuffix = report.failureKind === "infrastructure" ? " infra" : "";
-				return `- \`${report.requestId}\` [${report.status}${kindSuffix}] ${report.summary || "No summary."}`;
-			})
-		: ["- No verification reports yet."];
-	const verifier = state.verifierBackend ?? createDefaultVerifierBackend();
-	const verifierStatus = verifier.available
-		? verifier.degradedReason
-			? `${verifier.resolved} (degraded: ${verifier.degradedReason})`
-			: `${verifier.resolved} (healthy)`
-		: `${verifier.resolved} (unavailable)`;
+- Goal: \`${state.goal?.path ?? "unknown"}\`
+- Goal hash: \`${state.goal?.hash ?? "unknown"}\`
+- Repo root: \`${state.repoRoot || "unknown"}\`
+- Branch: \`${state.branch || "unknown"}\`
+- Mode: \`${state.mode}\`
+- Phase: \`${state.phase}\`
+- Cycle: \`${state.cycleNumber}\`
+- Iteration: \`${state.iteration}\`
+- Current item: ${state.currentItemId ? `\`${state.currentItemId}\`` : "none"}
+- Last cycle commit: ${state.lastCycleCommitSha ? `\`${state.lastCycleCommitSha}\`` : "none"}
+- Last cycle summary: ${state.lastCycleSummary || "none"}
+- Last cycle changed files: ${state.lastCycleChangedFiles?.length ? state.lastCycleChangedFiles.join(", ") : "none"}
+- Last cycle noop: ${state.lastCycleNoop ? "yes" : "no"}
+- Next cycle retry: ${state.nextCycleAt || "none"}
+- Goal satisfied in current cycle: ${state.goalSatisfied ? "yes" : "no"}
+- Completion summary: ${state.completionSummary || "none"}
+- Unresolved quality objectives: ${unresolvedObjectives.length ? unresolvedObjectives.join(", ") : "none"}
+- Last failure: ${state.lastFailure || "none"}
+- Stop reason: ${state.stopReason || "none"}
 
-	const blockerLines = getUnresolvedResearchBlockers(state).length
-		? getUnresolvedResearchBlockers(state).map((item) => `- ${item.title} (\`${item.id}\`)`)
-		: ["- None."];
+### Backlog
 
-	const lines = [
-		"## AutoDevelop",
-		"",
-		`- Goal: \`${state.goal?.path ?? "unknown"}\``,
-		`- Mode: \`${state.mode ?? "unknown"}\``,
-		`- Phase: \`${state.phase}\``,
-		`- Primary goal satisfied: ${state.goalSatisfied ? "yes" : "no"}`,
-		`- Iteration: ${state.iteration}`,
-		`- Current item: ${state.currentItemId ? `\`${state.currentItemId}\`` : "none"}`,
-		`- Goal hash: \`${state.goal?.hash ?? "unknown"}\``,
-		`- Pending verification item: ${state.pendingVerificationItemId ? `\`${state.pendingVerificationItemId}\`` : "none"}`,
-		`- Verifier backend: ${verifierStatus}`,
-	];
+${backlogLines}
 
-	if (state.completionSummary) lines.push(`- Goal completion summary: ${state.completionSummary}`);
-	if (state.lastVerificationSummary) lines.push(`- Last verification: ${state.lastVerificationSummary}`);
-	if (state.lastFailure) lines.push(`- Last failure: ${state.lastFailure}`);
-	if (state.stopReason) lines.push(`- Stop reason: ${state.stopReason}`);
+### Quality Objectives
 
-	lines.push(
-		"",
-		"### Research Providers",
-		"",
-		...providerLines,
-		"",
-		"### Recent Research",
-		"",
-		...artifactLines,
-		"",
-		"### Research Blockers",
-		"",
-		...blockerLines,
-		"",
-		"### Verification",
-		"",
-		...reportLines,
-		"",
-		"### Quality Objectives",
-		"",
-		...objectiveLines,
-		"",
-		"### Backlog",
-		"",
-		...backlogLines,
-	);
-	return lines.join("\n");
-}
+${objectiveLines}
 
-function looksLikeLoopState(value) {
-	return Boolean(value && value.goal?.path);
-}
+### Recent Research
 
-function looksLikeResearchDetails(value) {
-	return Boolean(value && (value.artifact?.id || value.providers));
-}
+${researchLines}
 
-export function migrateLoopState(rawState) {
-	if (!rawState) return null;
+### Recent AutoDevelop Commits
 
-	const nextState = cloneLoopState(rawState);
-	nextState.version = LOOP_STATE_VERSION;
-	nextState.goal = normalizeGoalSnapshot(nextState.goal);
-	nextState.backlog = normalizeBacklogItems(nextState.backlog ?? []).map(normalizeBacklogItemVerification);
-	nextState.goalSatisfied = Boolean(nextState.goalSatisfied);
-	nextState.mode =
-		nextState.mode && LOOP_MODES.includes(nextState.mode)
-			? nextState.mode
-			: nextState.phase === "improving"
-				? "improvement"
-				: nextState.goalSatisfied
-					? "hardening"
-					: "delivery";
-	assertValidMode(nextState.mode);
-
-	if (!nextState.phase || LEGACY_LOOP_PHASES.has(nextState.phase) || !LOOP_PHASES.includes(nextState.phase)) {
-		nextState.phase = derivePhaseFromState(nextState);
-	}
-
-	nextState.qualityObjectives = normalizeQualityObjectives(nextState.qualityObjectives, nextState.goal.explicitOptOuts);
-	nextState.researchArtifacts = normalizeResearchArtifacts(nextState.researchArtifacts);
-	nextState.researchProviders = normalizeResearchProviders(nextState.researchProviders);
-	nextState.verifierBackend = normalizeVerifierBackend(nextState.verifierBackend);
-	nextState.verificationRequests = normalizeVerificationRequests(nextState.verificationRequests);
-	nextState.verificationReports = normalizeVerificationReports(nextState.verificationReports);
-	nextState.lastVerificationSummary = nextState.lastVerificationSummary?.trim?.() ?? "";
-	nextState.lastFailure = nextState.lastFailure?.trim?.() ?? "";
-	nextState.stopReason = nextState.stopReason?.trim?.() ?? "";
-	nextState.completionSummary = nextState.completionSummary?.trim?.() ?? "";
-	nextState.iteration = Number.isFinite(nextState.iteration) ? nextState.iteration : 0;
-	nextState.currentItemId = nextState.currentItemId ?? null;
-	nextState.pendingVerificationItemId = nextState.pendingVerificationItemId ?? null;
-
-	return normalizeModeAndPhase(nextState);
-}
-
-export function reconstructStateFromEntries(entries) {
-	let latestState = null;
-
-	for (const entry of entries ?? []) {
-		if (entry.type === "message") {
-			const message = entry.message;
-			if (
-				message?.role === "toolResult" &&
-				message.toolName === "autodevelop_state" &&
-				looksLikeLoopState(message.details)
-			) {
-				latestState = migrateLoopState(message.details);
-			}
-
-			if (message?.role === "toolResult" && message.toolName === "autodevelop_research" && looksLikeResearchDetails(message.details)) {
-				if (looksLikeLoopState(message.details?.loopState)) {
-					latestState = migrateLoopState(message.details.loopState);
-					continue;
-				}
-				if (latestState && message.details.providers) {
-					latestState = applyStateAction(latestState, "sync_research_providers", { providers: message.details.providers });
-				}
-				if (latestState && message.details.artifact) {
-					latestState = applyStateAction(latestState, "record_research_artifact", { artifact: message.details.artifact });
-				}
-			}
-		}
-
-		if (entry.type === "custom" && entry.customType === "autodevelop-control" && looksLikeLoopState(entry.data?.state)) {
-			latestState = migrateLoopState(entry.data.state);
-		}
-
-		if ((entry.type === "compaction" || entry.type === "branch_summary") && looksLikeLoopState(entry.details?.loopState)) {
-			latestState = migrateLoopState(entry.details.loopState);
-		}
-	}
-
-	return latestState;
+${recentCommits}`;
 }
 
 export function buildLoopContext(state) {
-	if (!state) return "";
+	if (!state) {
+		return "AUTODEVELOP LOOP INACTIVE";
+	}
 
-	const backlogLines =
-		state.backlog.length === 0
-			? ["- No backlog items yet."]
-			: state.backlog.map((item) => {
-					const currentSuffix = item.id === state.currentItemId ? " <- current" : "";
-					const refs = item.objectiveRefs?.length ? ` -> ${item.objectiveRefs.join(", ")}` : "";
-					const evidence = item.evidenceRefs?.length ? ` evidence:${item.evidenceRefs.join(",")}` : "";
-					const blockers = item.dependsOnResearchItemIds?.length ? ` depends:${item.dependsOnResearchItemIds.join(",")}` : "";
-					const required = item.researchRequired ? " research-required" : "";
-					const verification = item.verificationRequired
-						? ` verify:${item.verificationStatus}${item.verificationRequestId ? ` req:${item.verificationRequestId}` : ""}${item.verificationReportId ? ` rep:${item.verificationReportId}` : ""}`
-						: " verify:disabled";
-					return `- [${item.status}] [${item.kind}] ${item.title} (${item.id})${refs}${evidence}${blockers}${required}${verification}${currentSuffix}`;
-				});
+	const backlogLines = state.backlog.length ? state.backlog.map((item) => formatBacklogLine(item, state)).join("\n") : "- none";
+	const recentCommits = state.recentCycleCommits?.length
+		? state.recentCycleCommits
+			.map((commit) => `- ${commit.shortSha || commit.sha.slice(0, 12)} ${commit.subject} (${commit.committedAt || "unknown"})`)
+			.join("\n")
+		: "- none";
+	const recentResearch = getRecentResearchArtifacts(state, 5)
+		.map((artifact) => `- ${artifact.id} [${artifact.provider}] ${artifact.summary || artifact.query || artifact.target || "No summary."}`)
+		.join("\n") || "- none";
+	const unresolvedQuality = getUnresolvedQualityObjectives(state);
+	const researchBlockers = getUnresolvedResearchBlockers(state)
+		.map((item) => `- ${item.title} (${item.id})`)
+		.join("\n") || "- none";
 
-	const structuredGoal = state.goal.presentSections?.length
-		? state.goal.presentSections.map((heading) => `## ${heading}\n${state.goal.sections[heading]}`).join("\n\n")
-		: state.goal.text.trim();
+	return `AUTODEVELOP LOOP ACTIVE
 
-	const objectiveLines = QUALITY_HARDENING_PRIORITY.map((objective) => {
-		const current = state.qualityObjectives?.[objective];
-		if (!current) return `- ${objective}: missing`;
-		const suffix = current.evidence ? ` (${current.evidence})` : "";
-		return `- ${objective}: [${current.status}]${suffix}`;
-	});
-
-	const providerLines = RESEARCH_PROVIDER_NAMES.map((provider) => {
-		const current = state.researchProviders?.[provider];
-		if (!current) return `- ${provider}: missing`;
-		const status = current.healthy ? "healthy" : current.configured ? "degraded" : "unconfigured";
-		const suffix = current.lastError ? ` (${current.lastError})` : "";
-		return `- ${provider}: [${status}] ${current.description}${suffix}`;
-	});
-
-	const recentArtifactLines = getRecentResearchArtifacts(state, 5).length
-		? getRecentResearchArtifacts(state, 5).map((artifact) => {
-				const sourceLine = artifact.sources?.[0]?.location ? ` @ ${artifact.sources[0].location}` : "";
-				return `- \`${artifact.id}\` [${artifact.provider}] ${artifact.summary || artifact.query || artifact.target}${sourceLine}`;
-			})
-		: ["- None yet."];
-	const verifier = state.verifierBackend ?? createDefaultVerifierBackend();
-	const recentReportLines = state.verificationReports?.slice(-3).reverse()?.length
-		? state.verificationReports
-				.slice(-3)
-				.reverse()
-				.map((report) => {
-					const kindSuffix = report.failureKind === "infrastructure" ? " infra" : "";
-					return `- \`${report.requestId}\` [${report.status}${kindSuffix}] ${report.summary || "No summary."}`;
-				})
-		: ["- None yet."];
-
-	const unresolvedObjectives = getUnresolvedQualityObjectives(state);
-	const unresolvedResearch = getUnresolvedResearchBlockers(state);
-	const optOuts = state.goal.explicitOptOuts?.length ? state.goal.explicitOptOuts.join(", ") : "none";
-
-	return `[AUTODEVELOP LOOP ACTIVE]
-Goal file: ${state.goal.path}
-Goal hash: ${state.goal.hash}
-Iteration: ${state.iteration}
+Goal file: ${state.goal?.path ?? "unknown"}
+Goal hash: ${state.goal?.hash ?? "unknown"}
+Repo root: ${state.repoRoot || "unknown"}
+Branch: ${state.branch || "unknown"}
 Mode: ${state.mode}
 Phase: ${state.phase}
-Primary goal satisfied: ${state.goalSatisfied ? "yes" : "no"}
-Current item: ${state.currentItemId ?? "none"}
+Cycle: ${state.cycleNumber}
+Iteration: ${state.iteration}
+Current item: ${state.currentItemId || "none"}
+Last cycle commit: ${state.lastCycleCommitSha || "none"}
+Last cycle summary: ${state.lastCycleSummary || "none"}
+Last cycle noop: ${state.lastCycleNoop ? "yes" : "no"}
+Next cycle retry: ${state.nextCycleAt || "none"}
 
-Immutable goal snapshot:
-${structuredGoal}
-
-Backlog:
-${backlogLines.join("\n")}
-
-Research provider health:
-${providerLines.join("\n")}
+Recent AutoDevelop commits:
+${recentCommits}
 
 Recent research artifacts:
-${recentArtifactLines.join("\n")}
+${recentResearch}
 
-Verifier backend:
-- configured: ${verifier.configured}
-- resolved: ${verifier.resolved}
-- available: ${verifier.available ? "yes" : "no"}
-- degraded reason: ${verifier.degradedReason || "none"}
+Research blockers:
+${researchBlockers}
 
-Recent verifier reports:
-${recentReportLines.join("\n")}
+Unresolved quality objectives:
+${unresolvedQuality.length ? unresolvedQuality.join(", ") : "none"}
 
-Unresolved research blockers:
-${unresolvedResearch.length ? unresolvedResearch.map((item) => `- ${item.title} (${item.id})`).join("\n") : "- none"}
-
-Quality objectives:
-${objectiveLines.join("\n")}
-
-Explicit opt-outs:
-${optOuts}
-
-Unresolved quality objectives in priority order:
-${unresolvedObjectives.length ? unresolvedObjectives.join(", ") : "none"}
-
-Last verification:
-${state.lastVerificationSummary || "None yet."}
-
-Last failure:
-${state.lastFailure || "None."}
+Backlog:
+${backlogLines}
 
 Rules:
-- Never modify the goal markdown file.
-- Call autodevelop_state with action="get" before changing the plan or claiming completion.
-- Use autodevelop_research as the default research interface. It always exists even if no external web provider is configured.
-- Unless explicitly opted out in the goal file, treat performance, latency, throughput, memory efficiency, scalability, and reliability as default success dimensions.
-- If you encounter uncertainty, assumptions, unknown behavior, unclear failures, or missing evidence during code, test, or verify work, immediately call autodevelop_state with action="flag_uncertainty" and continue through a dedicated research item.
-- Research items must gather evidenceRefs before they can be completed. Any non-research item marked research-required must cite evidenceRefs before it can be completed.
-- Every backlog item is verifier-gated. Never mark an item done directly until you have requested verification and received a passing result.
-- Use autodevelop_state with action="request_verification" when an item satisfies its acceptanceCriteria. The verifier is read-only and may reopen the task if evidence is insufficient.
-- Use autodevelop_state with action="block" only for whole-loop blockers. If one backlog item is blocked but other runnable work remains, keep the loop moving.
-- When backlog is empty in delivery mode, replan while accounting for unresolved quality objectives from the start.
-- When backlog is empty in hardening or improvement mode, prioritize unresolved quality objectives in this order: ${QUALITY_HARDENING_PRIORITY.join(", ")}.
-- For large-data and high-load systems, inspect chunking, batching, streaming, pagination, memory pressure, queue depth, retries, timeouts, idempotency, and backpressure unless explicitly opted out.
-- After hardening objectives are resolved, improvement mode should continue with these directions: ${IMPROVEMENT_DIRECTIONS.join(", ")}.
-- External web research should go through autodevelop_research, using the built-in provider chain.`;
+- Call autodevelop_state with action="get" before replacing the plan or claiming completion.
+- Keep backlog kinds to research, code, or test.
+- Use autodevelop_research as the default research interface for repo and web research.
+- If code or test work hits uncertainty, missing evidence, or unclear behavior, call autodevelop_state with action="flag_uncertainty" immediately.
+- Use update_item to move tasks through pending, in_progress, done, or blocked.
+- A task may be marked done directly once acceptance criteria and required evidence are satisfied.
+- Call autodevelop_state with action="complete" only when no pending or in-progress items remain, at least one item is done, and you can provide a non-empty completion summary.
+- Completing the cycle will create a git commit, preserve a local cycle summary, and relaunch the same goal in the same session.
+- Runtime-only paths under .pi/autodevelop and .autodevelop must never be committed.
+- Inspect large-data and high-load behavior for chunking, batching, streaming, pagination, memory pressure, queue depth, retries, timeouts, idempotency, and backpressure unless explicitly opted out.`;
 }

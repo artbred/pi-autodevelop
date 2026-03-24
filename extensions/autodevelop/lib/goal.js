@@ -151,7 +151,7 @@ Describe the final outcome the auto-develop loop must achieve.
 
 # Explicit Opt-Outs
 
-Leave this section empty unless you intentionally want to disable one of the default hardening objectives.
+Leave this section empty unless you intentionally want to disable one of the default quality objectives.
 Allowed values when needed: \`performance\`, \`latency\`, \`throughput\`, \`memory\`, \`scalability\`, \`reliability\`.
 `;
 }
