@@ -675,7 +675,9 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 
 		pendingAutoTurn = true;
 		try {
-			pi.sendUserMessage(appendLeaseSection(buildLoopTurnPrompt(loopState, reason), loopLease, currentSession.sessionId));
+			pi.sendUserMessage(appendLeaseSection(buildLoopTurnPrompt(loopState, reason), loopLease, currentSession.sessionId), {
+				deliverAs: "followUp",
+			});
 		} catch (error) {
 			pendingAutoTurn = false;
 			const message = error instanceof Error ? error.message : String(error);
