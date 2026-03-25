@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
+import { LOOP_SKILL_COMMAND } from "../extensions/autodevelop/lib/constants.js";
 import { writeLoopStateCheckpoint } from "../extensions/autodevelop/lib/checkpoint.js";
 import { readGoalSnapshot } from "../extensions/autodevelop/lib/goal.js";
 import { acquireLoopLease, readLoopLease } from "../extensions/autodevelop/lib/lease.js";
@@ -91,6 +92,7 @@ function createHarness() {
 	const builtinTools = ["read", "bash", "grep", "find", "ls", "edit", "write"].map((name) => ({ name }));
 	const messages = [];
 	const userMessages = [];
+	const userMessageCalls = [];
 	const activeTools = [];
 	const notifications = [];
 	let activeSession = null;
@@ -108,8 +110,9 @@ function createHarness() {
 		sendMessage(message) {
 			messages.push(message);
 		},
-		sendUserMessage(text) {
+		sendUserMessage(text, options) {
 			userMessages.push(text);
+			userMessageCalls.push({ text, options });
 		},
 		appendEntry(customType, data) {
 			assert.ok(activeSession, "appendEntry called without an active session");
@@ -129,11 +132,12 @@ function createHarness() {
 
 	autodevelopExtension(api);
 
-	function createContext({ sessionId, cwd, hasUI = false, confirmResult = true } = {}) {
+	function createContext({ sessionId, cwd, hasUI = false, confirmResult = true, model = undefined, apiKey = null, compactThrows = null } = {}) {
 		const branch = [];
 		const statusByKey = new Map();
 		const widgetByKey = new Map();
 		const notificationLog = [];
+		const compactCalls = [];
 
 		const ctx = {
 			hasUI,
@@ -187,10 +191,10 @@ function createHarness() {
 			},
 			modelRegistry: {
 				async getApiKey() {
-					return null;
+					return apiKey;
 				},
 			},
-			model: undefined,
+			model,
 			isIdle() {
 				return true;
 			},
@@ -202,7 +206,12 @@ function createHarness() {
 			getContextUsage() {
 				return undefined;
 			},
-			compact() {},
+			compact() {
+				compactCalls.push({ sessionId, cwd });
+				if (compactThrows) {
+					throw compactThrows;
+				}
+			},
 			waitForIdle: async () => undefined,
 			newSession: async () => ({ cancelled: false }),
 			fork: async () => ({ cancelled: false }),
@@ -211,6 +220,7 @@ function createHarness() {
 			_statusByKey: statusByKey,
 			_widgetByKey: widgetByKey,
 			_notificationLog: notificationLog,
+			_compactCalls: compactCalls,
 		};
 
 		return ctx;
@@ -240,6 +250,7 @@ function createHarness() {
 		callEvent,
 		messages,
 		userMessages,
+		userMessageCalls,
 		activeTools,
 		notifications,
 	};
@@ -393,7 +404,7 @@ test("state mutations rewrite the checkpoint after generic autodevelop_state act
 	assert.equal(checkpoint.state.lastFailure, "Blocked in test");
 });
 
-test("complete creates a git commit, excludes runtime files, and relaunches the next cycle", async () => {
+test("complete creates a git commit, persists relaunch intent, and agent_end queues the next cycle", async () => {
 	const repoDir = await createRepo();
 	const harness = createHarness();
 	const ctx = harness.createContext({ sessionId: "session-complete", cwd: repoDir });
@@ -413,7 +424,7 @@ test("complete creates a git commit, excludes runtime files, and relaunches the 
 
 	const subject = runGit(repoDir, ["log", "-1", "--pretty=%s"]);
 	const files = runGit(repoDir, ["show", "--name-only", "--format=", "HEAD"]).split(/\r?\n/).filter(Boolean);
-	const checkpoint = JSON.parse(await readFile(join(repoDir, ".pi", "autodevelop", "loop-state.json"), "utf8"));
+	let checkpoint = JSON.parse(await readFile(join(repoDir, ".pi", "autodevelop", "loop-state.json"), "utf8"));
 
 	assert.match(subject, /^autodevelop: cycle 1 - Ship the first cycle$/);
 	assert.deepEqual(files, ["src/app.js"]);
@@ -421,7 +432,21 @@ test("complete creates a git commit, excludes runtime files, and relaunches the 
 	assert.equal(checkpoint.state.lastCycleSummary, "Ship the first cycle");
 	assert.equal(checkpoint.state.lastCycleNoop, false);
 	assert.equal(checkpoint.state.backlog.length, 0);
-	assert.equal(harness.userMessages.length >= 2, true);
+	assert.equal(checkpoint.state.relaunchRequested, true);
+	assert.equal(checkpoint.state.cycleLaunchState, "not_started");
+	assert.equal(harness.userMessages.length, 1);
+
+	await harness.callEvent(ctx, "agent_end");
+
+	checkpoint = JSON.parse(await readFile(join(repoDir, ".pi", "autodevelop", "loop-state.json"), "utf8"));
+	assert.equal(checkpoint.state.cycleLaunchState, "queued");
+	assert.equal(checkpoint.state.relaunchRequested, true);
+	assert.equal(harness.userMessages.length, 2);
+	assert.equal(harness.userMessageCalls.at(-1).options.deliverAs, "followUp");
+	await harness.callEvent(ctx, "input", { source: "extension", text: harness.userMessages.at(-1) });
+	checkpoint = JSON.parse(await readFile(join(repoDir, ".pi", "autodevelop", "loop-state.json"), "utf8"));
+	assert.equal(checkpoint.state.cycleLaunchState, "acknowledged");
+	assert.equal(checkpoint.state.relaunchRequested, false);
 });
 
 test("complete without commit-worthy changes records a no-op cycle and schedules retry", async () => {
@@ -447,4 +472,78 @@ test("complete without commit-worthy changes records a no-op cycle and schedules
 	assert.equal(checkpoint.state.lastCycleNoop, true);
 	assert.match(checkpoint.state.nextCycleAt, /T/);
 	assert.equal(checkpoint.state.phase, "relaunching");
+});
+
+test("agent_end requests compaction after cycle close and session_compact performs the relaunch", async () => {
+	const repoDir = await createRepo();
+	const harness = createHarness();
+	const ctx = harness.createContext({
+		sessionId: "session-compact-relaunch",
+		cwd: repoDir,
+		model: "test-model",
+		apiKey: "test-key",
+	});
+
+	await harness.callCommand(ctx, "autodevelop", "start .pi/autodevelop/goal.md");
+	await harness.callEvent(ctx, "input", { source: "extension", text: harness.userMessages.at(-1) });
+	await writeFile(join(repoDir, "src", "app.js"), "export const value = 3;\n", "utf8");
+	await harness.callTool(ctx, "autodevelop_state", {
+		action: "replace_plan",
+		items: [{ id: "code-1", title: "Implement loop", kind: "code", status: "done", acceptanceCriteria: "Command works" }],
+	});
+	await harness.callTool(ctx, "autodevelop_state", {
+		action: "complete",
+		summary: "Ship the compacted cycle",
+	});
+
+	await harness.callEvent(ctx, "agent_end");
+
+	let checkpoint = JSON.parse(await readFile(join(repoDir, ".pi", "autodevelop", "loop-state.json"), "utf8"));
+	assert.equal(ctx._compactCalls.length, 1);
+	assert.equal(checkpoint.state.compactionRequested, true);
+	assert.equal(checkpoint.state.cycleLaunchState, "not_started");
+	assert.equal(harness.userMessages.length, 1);
+
+	await harness.callEvent(ctx, "session_compact", {
+		type: "session_compact",
+		fromExtension: true,
+		compactionEntry: { id: "compact-1", type: "compaction", summary: "summary" },
+	});
+
+	checkpoint = JSON.parse(await readFile(join(repoDir, ".pi", "autodevelop", "loop-state.json"), "utf8"));
+	assert.equal(checkpoint.state.cycleLaunchState, "queued");
+	assert.equal(checkpoint.state.compactionRequested, false);
+	assert.equal(harness.userMessages.length, 2);
+});
+
+test("resume repairs an unacknowledged cycle launch from checkpoint", async () => {
+	const repoDir = await createRepo();
+	const goal = await readGoalSnapshot(repoDir, ".pi/autodevelop/goal.md");
+	let state = createInitialLoopState(goal, undefined, {
+		repoRoot: repoDir,
+		branch: "main",
+	});
+	state = applyStateAction(state, "prepare_cycle_launch", {
+		launchId: "launch-1",
+		launchPrompt: `${LOOP_SKILL_COMMAND} reason=resume launch_id=launch-1\n\nContinue the autonomous development loop.`,
+		relaunchRequested: true,
+		compactionRequested: false,
+	});
+	await writeLoopStateCheckpoint(state);
+	await acquireLoopLease({
+		cwd: repoDir,
+		state,
+		sessionId: "session-relaunch-resume",
+		sessionFile: join(repoDir, ".pi", "sessions", "session-relaunch-resume.jsonl"),
+	});
+
+	const harness = createHarness();
+	const ctx = harness.createContext({ sessionId: "session-relaunch-resume", cwd: repoDir });
+
+	await harness.callCommand(ctx, "autodevelop", "resume");
+
+	const checkpoint = JSON.parse(await readFile(join(repoDir, ".pi", "autodevelop", "loop-state.json"), "utf8"));
+	assert.equal(checkpoint.state.cycleLaunchState, "queued");
+	assert.equal(checkpoint.state.relaunchRequested, true);
+	assert.equal(harness.userMessages.length, 1);
 });

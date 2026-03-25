@@ -2,6 +2,7 @@ import { complete, StringEnum } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { convertToLlm, serializeConversation } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 
@@ -59,6 +60,7 @@ import { buildToolProfile } from "./lib/tool-profiles.js";
 import { detectUncertaintyMarker } from "./lib/uncertainty.js";
 
 const NOOP_RETRY_DELAY_MS = 60000;
+const LAUNCH_REPAIR_DELAY_MS = 30000;
 
 const BacklogItemSchema = Type.Object({
 	id: Type.Optional(Type.String({ description: "Stable item id. Omit to auto-generate." })),
@@ -180,6 +182,37 @@ function formatRetryState(nextCycleAt?: string) {
 	};
 }
 
+function formatAgeLabel(timestamp?: string) {
+	if (!timestamp) return "none";
+	const parsed = Date.parse(timestamp);
+	if (!Number.isFinite(parsed)) return "invalid";
+
+	const elapsedMs = Math.max(0, Date.now() - parsed);
+	if (elapsedMs < 1000) return "0s";
+
+	const seconds = Math.floor(elapsedMs / 1000);
+	if (seconds < 60) return `${seconds}s`;
+
+	const minutes = Math.floor(seconds / 60);
+	if (minutes < 60) return `${minutes}m`;
+
+	const hours = Math.floor(minutes / 60);
+	if (hours < 48) return `${hours}h`;
+
+	return `${Math.floor(hours / 24)}d`;
+}
+
+function formatLaunchStatusToken(state: ReturnType<typeof cloneLoopState>) {
+	if (!state) return "n/a";
+	if (state.cycleLaunchState === "queued") {
+		return `queued@${formatAgeLabel(state.launchQueuedAt)}`;
+	}
+	if (state.cycleLaunchState === "acknowledged") {
+		return `ack@${formatAgeLabel(state.launchAcknowledgedAt)}`;
+	}
+	return state.cycleLaunchState || "unknown";
+}
+
 function buildQualityPrompt(state: ReturnType<typeof cloneLoopState>) {
 	const unresolved = getUnresolvedQualityObjectives(state);
 	const researchBlockers = getUnresolvedResearchBlockers(state);
@@ -193,12 +226,19 @@ function buildQualityPrompt(state: ReturnType<typeof cloneLoopState>) {
 	return `Unresolved quality objectives: ${unresolvedText}. Unresolved research blockers: ${blockerText}.`;
 }
 
-function buildLoopTurnPrompt(state: ReturnType<typeof cloneLoopState>, reason: string) {
+function buildLoopTurnPrompt(state: ReturnType<typeof cloneLoopState>, reason: string, options: { launchId?: string } = {}) {
 	const currentItem = state?.backlog.find((item) => item.id === state.currentItemId);
 	const currentItemLine = currentItem ? `Current item: [${currentItem.kind}] ${currentItem.title}` : "Current item: none";
 	const retry = formatRetryState(state?.nextCycleAt);
+	const recentCommits = (state?.recentCycleCommits ?? [])
+		.slice(0, 5)
+		.map((commit) => `- ${commit.shortSha || commit.sha.slice(0, 12)} ${commit.subject}`)
+		.join("\n") || "- none";
+	const changedFiles = state?.lastCycleChangedFiles?.length ? state.lastCycleChangedFiles.join(", ") : "none";
+	const blockers = state?.lastCycleBlockers?.length ? state.lastCycleBlockers.join("; ") : "none";
+	const launchIdLine = options.launchId ? ` launch_id=${options.launchId}` : "";
 
-	return `${LOOP_SKILL_COMMAND} reason=${reason}
+	return `${LOOP_SKILL_COMMAND} reason=${reason}${launchIdLine}
 
 Continue the autonomous development loop.
 
@@ -213,9 +253,15 @@ Iteration: ${state?.iteration ?? 0}
 Research providers: ${formatProviderSummary(state)}
 Last cycle commit: ${state?.lastCycleCommitSha ?? "none"}
 Last cycle summary: ${state?.lastCycleSummary || "none"}
+Last cycle changed files: ${changedFiles}
+Last cycle blockers: ${blockers}
 Last cycle noop: ${state?.lastCycleNoop ? "yes" : "no"}
 Next retry: ${retry.label}
+Cycle launch state: ${state?.cycleLaunchState ?? "unknown"}
 ${currentItemLine}
+
+Recent AutoDevelop commits:
+${recentCommits}
 
 Use autodevelop_state with action="get" first, then proceed with the next best action.
 Use autodevelop_research as the default research interface for repo and web research.
@@ -343,6 +389,7 @@ function buildLeaseOwnershipError(lease: Awaited<ReturnType<typeof readLoopLease
 
 function shouldRequireCleanRepoOnResume(state: ReturnType<typeof cloneLoopState>) {
 	if (!state) return true;
+	if (state.relaunchRequested || state.cycleLaunchState !== "acknowledged") return true;
 	if (state.phase === "relaunching") return true;
 	if (state.backlog.length === 0) return true;
 	return false;
@@ -362,6 +409,7 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 	let sawFlagUncertaintyThisTurn = false;
 	let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 	let noOpRetryTimer: ReturnType<typeof setTimeout> | null = null;
+	let launchRepairTimer: ReturnType<typeof setTimeout> | null = null;
 	let lastHydrationSource: "none" | "session" | "checkpoint" = "none";
 	let currentSession = {
 		sessionId: "",
@@ -395,6 +443,12 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 		noOpRetryTimer = null;
 	}
 
+	function stopLaunchRepair() {
+		if (!launchRepairTimer) return;
+		clearTimeout(launchRepairTimer);
+		launchRepairTimer = null;
+	}
+
 	function updateLoopUi(ctx: ExtensionContext) {
 		if (!ctx.hasUI) return;
 		const leaseSummary = formatLeaseSummary(loopLease, getSessionMeta(ctx).sessionId);
@@ -420,7 +474,8 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 		const unresolvedCount = getUnresolvedQualityObjectives(loopState).length;
 		const researchBlockers = getUnresolvedResearchBlockers(loopState).length;
 		const retry = formatRetryState(loopState.nextCycleAt);
-		const statusLine = `AD ${loopState.phase} c:${loopState.cycleNumber} ${done}/${total} q:${unresolvedCount} r:${researchBlockers} branch:${loopState.branch || "unknown"} lease:${leaseSummary.statusToken}`;
+		const launchStatus = formatLaunchStatusToken(loopState);
+		const statusLine = `AD ${loopState.phase} c:${loopState.cycleNumber} ${done}/${total} q:${unresolvedCount} r:${researchBlockers} branch:${loopState.branch || "unknown"} launch:${launchStatus} lease:${leaseSummary.statusToken}`;
 		ctx.ui.setStatus("autodevelop", statusLine);
 
 		const widgetLines = [
@@ -429,6 +484,8 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 			`branch ${loopState.branch || "unknown"} last_commit ${formatShortHash(loopState.lastCycleCommitSha)}`,
 			`last cycle ${truncateSingleLine(loopState.lastCycleSummary || "none", 120)}`,
 			`last noop ${loopState.lastCycleNoop ? "yes" : "no"} retry ${retry.label}`,
+			`launch ${loopState.cycleLaunchState} age ${formatAgeLabel(loopState.launchQueuedAt)} ack ${formatAgeLabel(loopState.launchAcknowledgedAt)}`,
+			`relaunch requested ${loopState.relaunchRequested ? "yes" : "no"} compaction ${loopState.compactionRequested ? "yes" : "no"} recoveries ${loopState.recoveryCount ?? 0}`,
 			`lease owner ${leaseSummary.owner}`,
 			`lease age ${leaseSummary.age} freshness ${leaseSummary.freshness} owned ${leaseSummary.ownership}`,
 			`providers ${formatProviderSummary(loopState)}`,
@@ -477,11 +534,19 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 			void withStateLock(async () => {
 				if (!loopState || !currentSessionOwnsLease(ctx)) return;
 				if (loopState.nextCycleAt && Date.parse(loopState.nextCycleAt) > Date.now()) return;
-				loopState = cloneLoopState(loopState);
-				loopState.nextCycleAt = "";
-				loopState.phase = "planning";
+				loopState = applyStateAction(loopState, "prepare_cycle_launch", {
+					launchId: loopState.launchId,
+					launchPrompt: loopState.launchPrompt,
+					nextCycleAt: "",
+					compactionRequested: false,
+					relaunchRequested: true,
+					recoveryCount: loopState.recoveryCount ?? 0,
+				});
 				await commitLoopState(ctx, "cycle:retry-ready");
-				await queueLoopTurn(ctx, "no-op-retry");
+				await maybeRelaunchCycle(ctx, "no-op-retry", {
+					allowCompaction: false,
+					force: true,
+				});
 			});
 		}, delay);
 		noOpRetryTimer.unref?.();
@@ -577,6 +642,9 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 				loopLease = refreshed;
 			}
 		}
+		if (!loopState.relaunchRequested || loopState.cycleLaunchState === "acknowledged") {
+			stopLaunchRepair();
+		}
 		syncToolProfile();
 		updateLoopUi(ctx);
 	}
@@ -656,10 +724,172 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 		lastHydrationSource = "session";
 	}
 
+	function shouldWaitForRetry(state: ReturnType<typeof cloneLoopState>) {
+		return Boolean(state?.nextCycleAt && Date.parse(state.nextCycleAt) > Date.now());
+	}
+
+	function needsCycleLaunchRepair(state: ReturnType<typeof cloneLoopState>) {
+		if (!state) return false;
+		if (!state.relaunchRequested && state.cycleLaunchState === "acknowledged") return false;
+		if (shouldWaitForRetry(state)) return false;
+		if (state.cycleLaunchState === "queued") {
+			const queuedAt = Date.parse(state.launchQueuedAt);
+			return !Number.isFinite(queuedAt) || Date.now() - queuedAt >= LAUNCH_REPAIR_DELAY_MS;
+		}
+		if (state.relaunchRequested && state.cycleLaunchState === "not_started") return true;
+		return state.phase === "planning" && state.backlog.length === 0 && state.cycleLaunchState !== "acknowledged";
+	}
+
+	function matchesQueuedCycleLaunch(eventText: string, state: ReturnType<typeof cloneLoopState>) {
+		if (!state) return false;
+		if (state.launchId && eventText.includes(`launch_id=${state.launchId}`)) {
+			return true;
+		}
+		return Boolean(state.launchPrompt) && eventText === state.launchPrompt;
+	}
+
+	function armLaunchRepairTimer(ctx: ExtensionContext) {
+		stopLaunchRepair();
+		if (!loopState?.relaunchRequested) return;
+		launchRepairTimer = setTimeout(() => {
+			void withStateLock(async () => {
+				await repairCycleLaunchIfNeeded(ctx, "watchdog");
+			});
+		}, LAUNCH_REPAIR_DELAY_MS);
+		launchRepairTimer.unref?.();
+	}
+
+	async function ensureCycleLaunchIntent(ctx: ExtensionContext, reason: string, { force = false } = {}) {
+		if (!loopState) return false;
+		if (!force && loopState.launchPrompt && loopState.launchId) return false;
+
+		const launchId = randomUUID();
+		const launchPrompt = appendLeaseSection(buildLoopTurnPrompt(loopState, reason, { launchId }), loopLease, currentSession.sessionId);
+		loopState = applyStateAction(loopState, "prepare_cycle_launch", {
+			launchId,
+			launchPrompt,
+			nextCycleAt: loopState.nextCycleAt,
+			relaunchRequested: true,
+			compactionRequested: loopState.compactionRequested,
+			recoveryCount: loopState.recoveryCount ?? 0,
+		});
+		await commitLoopState(ctx, `launch:prepare:${reason}`);
+		return true;
+	}
+
+	async function canRequestCompaction(ctx: ExtensionContext) {
+		if (typeof ctx.compact !== "function") return false;
+		if (!ctx.model) return false;
+		const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
+		return Boolean(apiKey);
+	}
+
+	async function queuePersistedCycleLaunch(
+		ctx: ExtensionContext,
+		reason: string,
+		{ recovery = false, force = false }: { recovery?: boolean; force?: boolean } = {},
+	) {
+		await syncLeaseState(ctx, loopState);
+		if (!currentSessionOwnsLease(ctx)) return false;
+		if (!loopState || !isLoopRunning(loopState)) return false;
+		if (shouldWaitForRetry(loopState)) return false;
+		if (!(await ensureGoalIsUnchanged(ctx))) return false;
+		await ensureCycleLaunchIntent(ctx, reason);
+		if (!loopState?.launchPrompt) return false;
+		if (!force) {
+			if (ctx.hasPendingMessages()) return false;
+			if (loopState.cycleLaunchState === "queued" && !needsCycleLaunchRepair(loopState)) return false;
+			if (pendingAutoTurn && loopState.cycleLaunchState !== "queued") return false;
+		}
+
+		const shouldIncrementIteration = loopState.cycleLaunchState !== "queued" && loopState.iteration === 0;
+		if (recovery) {
+			loopState = applyStateAction(loopState, "record_launch_recovery");
+		}
+		loopState = applyStateAction(loopState, "queue_cycle_launch", {
+			queuedAt: new Date().toISOString(),
+			compactionRequested: false,
+			nextCycleAt: "",
+		});
+		if (shouldIncrementIteration) {
+			loopState.iteration += 1;
+		}
+		await commitLoopState(ctx, `${recovery ? "launch:recover" : "launch:queue"}:${reason}`);
+
+		pendingAutoTurn = true;
+		armLaunchRepairTimer(ctx);
+		try {
+			pi.sendUserMessage(loopState.launchPrompt, {
+				deliverAs: "followUp",
+			});
+			return true;
+		} catch (error) {
+			pendingAutoTurn = false;
+			const message = error instanceof Error ? error.message : String(error);
+			emitLoopMessage(`## AutoDevelop Error\n\nFailed to queue the next cycle launch.\n\n${message}`);
+			return false;
+		}
+	}
+
+	async function maybeRelaunchCycle(
+		ctx: ExtensionContext,
+		reason: string,
+		{ allowCompaction = true, recovery = false, force = false }: { allowCompaction?: boolean; recovery?: boolean; force?: boolean } = {},
+	) {
+		await syncLeaseState(ctx, loopState);
+		if (!currentSessionOwnsLease(ctx)) return false;
+		if (!loopState || !isLoopRunning(loopState)) return false;
+		if (!loopState.relaunchRequested && loopState.cycleLaunchState === "acknowledged") return false;
+		if (shouldWaitForRetry(loopState)) {
+			scheduleNoOpRetry(ctx, loopState.nextCycleAt);
+			return false;
+		}
+
+		await ensureCycleLaunchIntent(ctx, reason);
+		if (!loopState) return false;
+
+		if (allowCompaction && loopState.compactionRequested) {
+			armLaunchRepairTimer(ctx);
+			return true;
+		}
+
+		if (allowCompaction && loopState.cycleLaunchState === "not_started" && (await canRequestCompaction(ctx))) {
+			loopState = cloneLoopState(loopState);
+			loopState.compactionRequested = true;
+			await commitLoopState(ctx, `launch:compact-request:${reason}`);
+			armLaunchRepairTimer(ctx);
+			try {
+				ctx.compact?.();
+				return true;
+			} catch (error) {
+				loopState = cloneLoopState(loopState);
+				loopState.compactionRequested = false;
+				await commitLoopState(ctx, `launch:compact-failed:${reason}`);
+				const message = error instanceof Error ? error.message : String(error);
+				emitLoopMessage(`## AutoDevelop Warning\n\nCompaction failed before relaunch. Falling back to a direct launch.\n\n${message}`);
+			}
+		}
+
+		return queuePersistedCycleLaunch(ctx, reason, { recovery, force });
+	}
+
+	async function repairCycleLaunchIfNeeded(ctx: ExtensionContext, reason: string) {
+		await syncLeaseState(ctx, loopState);
+		if (!currentSessionOwnsLease(ctx)) return false;
+		if (!loopState || !isLoopRunning(loopState)) return false;
+		if (!needsCycleLaunchRepair(loopState)) return false;
+		return maybeRelaunchCycle(ctx, reason, {
+			allowCompaction: false,
+			recovery: true,
+			force: true,
+		});
+	}
+
 	async function queueLoopTurn(ctx: ExtensionContext, reason: string) {
 		await syncLeaseState(ctx, loopState);
 		if (!currentSessionOwnsLease(ctx)) return;
 		if (!loopState || !isLoopRunning(loopState)) return;
+		if (loopState.relaunchRequested || loopState.cycleLaunchState !== "acknowledged") return;
 		if (pendingAutoTurn || ctx.hasPendingMessages()) return;
 		if (loopState.nextCycleAt && Date.parse(loopState.nextCycleAt) > Date.now()) return;
 		if (!(await ensureGoalIsUnchanged(ctx))) return;
@@ -754,12 +984,14 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 				state: loopState,
 			});
 			await commitLoopState(ctx, "cycle:no-op");
-			await ctx.compact?.();
 			loopState = applyStateAction(loopState, "begin_next_cycle", {
 				nextCycleAt,
 				recentCycleCommits,
+				relaunchRequested: true,
+				compactionRequested: false,
+				recoveryCount: 0,
 			});
-			await commitLoopState(ctx, "cycle:relaunch");
+			await ensureCycleLaunchIntent(ctx, "no-op-retry", { force: true });
 			scheduleNoOpRetry(ctx, nextCycleAt);
 			return {
 				noop: true,
@@ -794,12 +1026,14 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 			state: loopState,
 		});
 		await commitLoopState(ctx, "cycle:commit");
-		await ctx.compact?.();
 		loopState = applyStateAction(loopState, "begin_next_cycle", {
 			recentCycleCommits,
+			relaunchRequested: true,
+			compactionRequested: false,
+			recoveryCount: 0,
 		});
-		await commitLoopState(ctx, "cycle:relaunch");
-		await queueLoopTurn(ctx, "cycle-complete");
+		await ensureCycleLaunchIntent(ctx, "cycle-complete", { force: true });
+		armLaunchRepairTimer(ctx);
 		return {
 			noop: false,
 			commitSha: commit.commitSha,
@@ -880,6 +1114,7 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 								return;
 							}
 							await commitLoopState(ctx, "start");
+							await ensureCycleLaunchIntent(ctx, "start", { force: true });
 							emitLoopMessage(
 								appendLeaseSection(
 									`## AutoDevelop Started\n\n- Goal: \`${goalSnapshot.path}\`\n- Hash: \`${goalSnapshot.hash}\`\n- Read-only protection: ${goalSnapshot.readonlyProtection ? "enabled" : "best effort only"}\n- Branch: ${loopState.branch}\n- Research providers: ${formatProviderSummary(loopState)}`,
@@ -887,7 +1122,7 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 									currentSession.sessionId,
 								),
 							);
-							await queueLoopTurn(ctx, "start");
+							await maybeRelaunchCycle(ctx, "start", { allowCompaction: false, force: true });
 						} catch (error) {
 							ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 						}
@@ -912,6 +1147,7 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 						}
 
 						stopNoOpRetry();
+						stopLaunchRepair();
 						loopState = applyStateAction(loopState, "set_phase", { phase: "paused" });
 						await commitLoopState(ctx, "pause");
 						emitLoopMessage("## AutoDevelop Paused");
@@ -939,11 +1175,19 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 							assertCommitEligibility(loopState.repoRoot);
 						}
 						if (loopState.nextCycleAt && Date.parse(loopState.nextCycleAt) <= Date.now()) {
-							loopState = cloneLoopState(loopState);
-							loopState.nextCycleAt = "";
-							loopState.phase = "planning";
+							loopState = applyStateAction(loopState, "prepare_cycle_launch", {
+								launchId: loopState.launchId,
+								launchPrompt: loopState.launchPrompt,
+								nextCycleAt: "",
+								relaunchRequested: loopState.relaunchRequested || loopState.cycleLaunchState !== "acknowledged",
+								compactionRequested: false,
+								recoveryCount: loopState.recoveryCount ?? 0,
+							});
 						}
-						const nextPhase = loopState.nextCycleAt
+						const hasPendingCycleLaunch = loopState.relaunchRequested || loopState.cycleLaunchState !== "acknowledged";
+						const nextPhase = hasPendingCycleLaunch
+							? (loopState.nextCycleAt ? "relaunching" : "planning")
+							: loopState.nextCycleAt
 							? "relaunching"
 							: nextRunnablePhase({
 									...loopState,
@@ -959,7 +1203,13 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 						emitLoopMessage(
 							appendLeaseSection(`## AutoDevelop Resumed\n\nPhase: \`${nextPhase}\`\n\nBranch: \`${loopState.branch}\``, loopLease, currentSession.sessionId),
 						);
-						if (loopState.nextCycleAt) {
+						if (hasPendingCycleLaunch) {
+							await maybeRelaunchCycle(ctx, "resume", {
+								allowCompaction: false,
+								recovery: loopState.cycleLaunchState === "queued",
+								force: true,
+							});
+						} else if (loopState.nextCycleAt) {
 							scheduleNoOpRetry(ctx, loopState.nextCycleAt);
 						} else {
 							await queueLoopTurn(ctx, "resume");
@@ -996,11 +1246,19 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 							assertCommitEligibility(loopState.repoRoot);
 						}
 						if (loopState.nextCycleAt && Date.parse(loopState.nextCycleAt) <= Date.now()) {
-							loopState = cloneLoopState(loopState);
-							loopState.nextCycleAt = "";
-							loopState.phase = "planning";
+							loopState = applyStateAction(loopState, "prepare_cycle_launch", {
+								launchId: loopState.launchId,
+								launchPrompt: loopState.launchPrompt,
+								nextCycleAt: "",
+								relaunchRequested: loopState.relaunchRequested || loopState.cycleLaunchState !== "acknowledged",
+								compactionRequested: false,
+								recoveryCount: loopState.recoveryCount ?? 0,
+							});
 						}
-						const nextPhase = loopState.nextCycleAt
+						const hasPendingCycleLaunch = loopState.relaunchRequested || loopState.cycleLaunchState !== "acknowledged";
+						const nextPhase = hasPendingCycleLaunch
+							? (loopState.nextCycleAt ? "relaunching" : "planning")
+							: loopState.nextCycleAt
 							? "relaunching"
 							: nextRunnablePhase({
 									...loopState,
@@ -1016,7 +1274,13 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 						emitLoopMessage(
 							appendLeaseSection(`## AutoDevelop Recovered\n\nPhase: \`${nextPhase}\`\n\nBranch: \`${loopState.branch}\``, loopLease, currentSession.sessionId),
 						);
-						if (loopState.nextCycleAt) {
+						if (hasPendingCycleLaunch) {
+							await maybeRelaunchCycle(ctx, "recover", {
+								allowCompaction: false,
+								recovery: loopState.cycleLaunchState === "queued",
+								force: true,
+							});
+						} else if (loopState.nextCycleAt) {
 							scheduleNoOpRetry(ctx, loopState.nextCycleAt);
 						} else {
 							await queueLoopTurn(ctx, "recover");
@@ -1036,6 +1300,7 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 						}
 
 						stopNoOpRetry();
+						stopLaunchRepair();
 						loopState = cloneLoopState(loopState);
 						loopState.phase = "stopped";
 						loopState.stopReason = "Stopped by user";
@@ -1248,12 +1513,16 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		await withStateLock(async () => {
 			await hydrateState(ctx);
+			if (loopState?.relaunchRequested && currentSessionOwnsLease(ctx)) {
+				armLaunchRepairTimer(ctx);
+			}
 		});
 	});
 	pi.on("session_before_switch", async (_event, ctx) => {
 		await withStateLock(async () => {
 			rememberSession(ctx);
 			stopNoOpRetry();
+			stopLaunchRepair();
 			await releaseOwnedLease(ctx);
 			loopState = null;
 			loopLease = null;
@@ -1266,12 +1535,16 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 	pi.on("session_switch", async (_event, ctx) => {
 		await withStateLock(async () => {
 			await hydrateState(ctx);
+			if (loopState?.relaunchRequested && currentSessionOwnsLease(ctx)) {
+				armLaunchRepairTimer(ctx);
+			}
 		});
 	});
 	pi.on("session_before_fork", async (_event, ctx) => {
 		await withStateLock(async () => {
 			rememberSession(ctx);
 			stopNoOpRetry();
+			stopLaunchRepair();
 			await releaseOwnedLease(ctx);
 			loopLease = null;
 			stopLeaseHeartbeat();
@@ -1280,17 +1553,24 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 	pi.on("session_fork", async (_event, ctx) => {
 		await withStateLock(async () => {
 			await hydrateState(ctx);
+			if (loopState?.relaunchRequested && currentSessionOwnsLease(ctx)) {
+				armLaunchRepairTimer(ctx);
+			}
 		});
 	});
 	pi.on("session_tree", async (_event, ctx) => {
 		await withStateLock(async () => {
 			await hydrateState(ctx);
+			if (loopState?.relaunchRequested && currentSessionOwnsLease(ctx)) {
+				armLaunchRepairTimer(ctx);
+			}
 		});
 	});
 	pi.on("session_shutdown", async (_event, ctx) => {
 		await withStateLock(async () => {
 			rememberSession(ctx);
 			stopNoOpRetry();
+			stopLaunchRepair();
 			await releaseOwnedLease(ctx);
 			loopState = null;
 			loopLease = null;
@@ -1299,10 +1579,24 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 		});
 	});
 
-	pi.on("input", async (event) => {
-		if (event.source === "extension" && event.text.startsWith(LOOP_SKILL_COMMAND)) {
-			pendingAutoTurn = false;
-		}
+	pi.on("input", async (event, ctx) => {
+		await withStateLock(async () => {
+			if (event.source === "extension" && event.text.startsWith(LOOP_SKILL_COMMAND)) {
+				pendingAutoTurn = false;
+			}
+			if (!ctx) return;
+			await syncLeaseState(ctx, loopState);
+			if (!currentSessionOwnsLease(ctx)) return;
+			if (!loopState) return;
+			if (event.source !== "extension") return;
+			if (!matchesQueuedCycleLaunch(event.text, loopState)) return;
+			if (loopState.cycleLaunchState === "acknowledged" && !loopState.relaunchRequested) return;
+
+			loopState = applyStateAction(loopState, "acknowledge_cycle_launch", {
+				acknowledgedAt: new Date().toISOString(),
+			});
+			await commitLoopState(ctx, "launch:ack");
+		});
 	});
 
 	pi.on("context", async (event) => {
@@ -1340,11 +1634,25 @@ export default function autodevelopExtension(pi: ExtensionAPI) {
 		if (!loopState || !isLoopRunning(loopState)) return;
 		if (ctx.hasPendingMessages()) return;
 		if (await enforceUncertaintyResearch(ctx)) return;
+		if (loopState.relaunchRequested || loopState.cycleLaunchState !== "acknowledged") {
+			await maybeRelaunchCycle(ctx, "agent-end");
+			return;
+		}
 		if (loopState.nextCycleAt && Date.parse(loopState.nextCycleAt) > Date.now()) {
 			scheduleNoOpRetry(ctx, loopState.nextCycleAt);
 			return;
 		}
 		await queueLoopTurn(ctx, "continue");
+	});
+
+	pi.on("session_compact", async (_event, ctx) => {
+		await withStateLock(async () => {
+			pendingAutoTurn = false;
+			await maybeRelaunchCycle(ctx, "session-compact", {
+				allowCompaction: false,
+				force: true,
+			});
+		});
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
@@ -1408,6 +1716,7 @@ Preserve the following as first-class data:
 - unfinished backlog items with status, kind, objectiveRefs, evidenceRefs, and research dependencies
 - current item id
 - last cycle commit sha, last cycle summary, last cycle changed files, and last cycle no-op state
+- cycle launch state, launch prompt, launch queued/acknowledged timestamps, relaunch request status, compaction request status, and recovery count
 - recent AutoDevelop commits from git history
 - next retry time if a no-op cycle is waiting
 - last failure or stop reason

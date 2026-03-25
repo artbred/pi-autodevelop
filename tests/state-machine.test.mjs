@@ -151,6 +151,37 @@ test("complete requires a closed backlog and a non-empty summary", () => {
 	assert.equal(completed.completionSummary, "Cycle is ready to commit");
 });
 
+test("cycle launch actions persist durable relaunch state across a hard reset", () => {
+	const initial = createInitialLoopState(makeGoal(), undefined, {
+		repoRoot: "/tmp/project",
+		branch: "main",
+	});
+	const nextCycle = applyStateAction(initial, "begin_next_cycle", {
+		relaunchRequested: true,
+		compactionRequested: false,
+		recoveryCount: 0,
+	});
+	const prepared = applyStateAction(nextCycle, "prepare_cycle_launch", {
+		launchId: "launch-1",
+		launchPrompt: "/skill:auto-develop-loop reason=cycle-complete launch_id=launch-1",
+		relaunchRequested: true,
+		compactionRequested: false,
+	});
+	const queued = applyStateAction(prepared, "queue_cycle_launch", {
+		queuedAt: "2026-03-25T00:00:00.000Z",
+	});
+	const acknowledged = applyStateAction(queued, "acknowledge_cycle_launch", {
+		acknowledgedAt: "2026-03-25T00:00:05.000Z",
+	});
+
+	assert.equal(prepared.cycleLaunchState, "not_started");
+	assert.equal(queued.cycleLaunchState, "queued");
+	assert.equal(queued.relaunchRequested, true);
+	assert.equal(acknowledged.cycleLaunchState, "acknowledged");
+	assert.equal(acknowledged.relaunchRequested, false);
+	assert.equal(acknowledged.launchAcknowledgedAt, "2026-03-25T00:00:05.000Z");
+});
+
 test("update_objective tracks evidence and resolves all enabled quality objectives", () => {
 	let state = createInitialLoopState(makeGoal());
 
@@ -219,12 +250,30 @@ test("migrateLoopState tolerates legacy verifier-backed state and verify items",
 		},
 	});
 
-	assert.equal(migrated.version, 5);
+	assert.equal(migrated.version, 6);
 	assert.equal(migrated.mode, "cycle");
 	assert.equal(migrated.repoRoot, "/tmp/project");
 	assert.equal(migrated.backlog[0].kind, "test");
 	assert.equal(migrated.backlog[0].status, "pending");
 	assert.equal(migrated.phase, "testing");
+});
+
+test("migrateLoopState infers an unacknowledged launch when a new cycle was persisted empty", () => {
+	const migrated = migrateLoopState({
+		version: 5,
+		goal: makeGoal(),
+		mode: "cycle",
+		phase: "planning",
+		backlog: [],
+		iteration: 0,
+		cycleNumber: 2,
+		currentItemId: null,
+		repoRoot: "/tmp/project",
+		branch: "main",
+	});
+
+	assert.equal(migrated.cycleLaunchState, "not_started");
+	assert.equal(migrated.relaunchRequested, true);
 });
 
 test("builds loop context and markdown for the git cycle flow", () => {

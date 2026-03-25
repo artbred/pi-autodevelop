@@ -1,6 +1,7 @@
 import {
 	ACTIVE_PHASES,
 	BACKLOG_KINDS,
+	CYCLE_LAUNCH_STATES,
 	ITEM_STATUSES,
 	LEGACY_LOOP_PHASES,
 	LOOP_MODES,
@@ -59,6 +60,12 @@ function assertValidMode(mode) {
 function assertValidPhase(phase) {
 	if (!LOOP_PHASES.includes(phase)) {
 		throw new Error(`Invalid loop phase: ${phase}`);
+	}
+}
+
+function assertValidCycleLaunchState(state) {
+	if (!CYCLE_LAUNCH_STATES.includes(state)) {
+		throw new Error(`Invalid cycle launch state: ${state}`);
 	}
 }
 
@@ -394,6 +401,37 @@ function normalizePhase(phase) {
 	return "planning";
 }
 
+function normalizeCycleLaunchState(value, fallback = "acknowledged") {
+	const normalized = trimText(value).toLowerCase();
+	if (CYCLE_LAUNCH_STATES.includes(normalized)) {
+		return normalized;
+	}
+	return fallback;
+}
+
+function inferCycleLaunchState(state, backlog, phase, currentItemId) {
+	const explicit = trimText(state?.cycleLaunchState);
+	if (explicit) {
+		return normalizeCycleLaunchState(explicit);
+	}
+
+	const launchQueuedAt = trimText(state?.launchQueuedAt);
+	const launchAcknowledgedAt = trimText(state?.launchAcknowledgedAt);
+	if (launchQueuedAt && !launchAcknowledgedAt) {
+		return "queued";
+	}
+
+	if (backlog.length > 0 || currentItemId || (Number.isFinite(state?.iteration) && state.iteration > 0)) {
+		return "acknowledged";
+	}
+
+	if ((phase === "planning" || phase === "relaunching") && !state?.goalSatisfied) {
+		return "not_started";
+	}
+
+	return "acknowledged";
+}
+
 export function createInitialLoopState(goalSnapshot, researchProviders = createDefaultResearchProviders(), repoContext = {}) {
 	const goal = normalizeGoalSnapshot(goalSnapshot);
 
@@ -413,6 +451,14 @@ export function createInitialLoopState(goalSnapshot, researchProviders = createD
 		lastCycleBlockers: [],
 		nextCycleAt: "",
 		recentCycleCommits: normalizeCycleCommits(repoContext.recentCycleCommits),
+		cycleLaunchState: "not_started",
+		launchId: "",
+		launchPrompt: "",
+		launchQueuedAt: "",
+		launchAcknowledgedAt: "",
+		relaunchRequested: false,
+		compactionRequested: false,
+		recoveryCount: 0,
 		goalSatisfied: false,
 		completionSummary: "",
 		currentItemId: null,
@@ -674,6 +720,53 @@ export function applyStateAction(state, action, params = {}) {
 			return nextState;
 		}
 
+		case "prepare_cycle_launch": {
+			nextState.cycleLaunchState = "not_started";
+			nextState.launchId = trimText(params.launchId);
+			nextState.launchPrompt = trimText(params.launchPrompt);
+			nextState.launchQueuedAt = "";
+			nextState.launchAcknowledgedAt = "";
+			nextState.relaunchRequested = params.relaunchRequested === undefined ? true : Boolean(params.relaunchRequested);
+			nextState.compactionRequested = Boolean(params.compactionRequested);
+			nextState.recoveryCount = Number.isFinite(params.recoveryCount) && params.recoveryCount >= 0 ? params.recoveryCount : 0;
+			if (params.nextCycleAt !== undefined) {
+				nextState.nextCycleAt = trimText(params.nextCycleAt);
+				nextState.phase = nextState.nextCycleAt ? "relaunching" : "planning";
+			}
+			return nextState;
+		}
+
+		case "queue_cycle_launch": {
+			nextState.cycleLaunchState = "queued";
+			nextState.launchQueuedAt = trimText(params.queuedAt) || new Date().toISOString();
+			nextState.relaunchRequested = true;
+			nextState.compactionRequested = Boolean(params.compactionRequested);
+			if (params.nextCycleAt !== undefined) {
+				nextState.nextCycleAt = trimText(params.nextCycleAt);
+			}
+			if (!nextState.nextCycleAt) {
+				nextState.phase = "planning";
+			}
+			return nextState;
+		}
+
+		case "acknowledge_cycle_launch": {
+			nextState.cycleLaunchState = "acknowledged";
+			nextState.launchAcknowledgedAt = trimText(params.acknowledgedAt) || new Date().toISOString();
+			nextState.relaunchRequested = false;
+			nextState.compactionRequested = false;
+			nextState.nextCycleAt = "";
+			if (nextState.phase === "relaunching") {
+				nextState.phase = "planning";
+			}
+			return nextState;
+		}
+
+		case "record_launch_recovery": {
+			nextState.recoveryCount = Math.max(0, Number(nextState.recoveryCount) || 0) + 1;
+			return nextState;
+		}
+
 		case "begin_next_cycle": {
 			nextState.cycleNumber = Math.max(1, Number(nextState.cycleNumber || 1)) + 1;
 			nextState.phase = trimText(params.nextCycleAt) ? "relaunching" : "planning";
@@ -685,6 +778,14 @@ export function applyStateAction(state, action, params = {}) {
 			nextState.stopReason = "";
 			nextState.iteration = 0;
 			nextState.nextCycleAt = trimText(params.nextCycleAt);
+			nextState.cycleLaunchState = "not_started";
+			nextState.launchId = trimText(params.launchId);
+			nextState.launchPrompt = trimText(params.launchPrompt);
+			nextState.launchQueuedAt = "";
+			nextState.launchAcknowledgedAt = "";
+			nextState.relaunchRequested = params.relaunchRequested === undefined ? true : Boolean(params.relaunchRequested);
+			nextState.compactionRequested = Boolean(params.compactionRequested);
+			nextState.recoveryCount = Number.isFinite(params.recoveryCount) && params.recoveryCount >= 0 ? params.recoveryCount : 0;
 			if (params.recentCycleCommits !== undefined) {
 				nextState.recentCycleCommits = normalizeCycleCommits(params.recentCycleCommits);
 			}
@@ -703,11 +804,13 @@ export function migrateLoopState(state) {
 	const backlog = normalizeBacklog(state.backlog);
 	const currentItemId = trimText(state.currentItemId);
 	const currentId = currentItemId && backlog.some((item) => item.id === currentItemId) ? currentItemId : selectCurrentItemId(backlog);
+	const normalizedPhase = normalizePhase(state.phase);
+	const cycleLaunchState = inferCycleLaunchState(state, backlog, normalizedPhase, currentId);
 
 	const nextState = {
 		version: LOOP_STATE_VERSION,
 		mode: normalizeMode(state.mode),
-		phase: normalizePhase(state.phase),
+		phase: normalizedPhase,
 		goal,
 		repoRoot: trimText(state.repoRoot) || trimText(state.verifierBackend?.repoRoot),
 		branch: trimText(state.branch),
@@ -720,6 +823,17 @@ export function migrateLoopState(state) {
 		lastCycleBlockers: normalizeCycleBlockers(state.lastCycleBlockers),
 		nextCycleAt: trimText(state.nextCycleAt),
 		recentCycleCommits: normalizeCycleCommits(state.recentCycleCommits),
+		cycleLaunchState,
+		launchId: trimText(state.launchId),
+		launchPrompt: trimText(state.launchPrompt),
+		launchQueuedAt: trimText(state.launchQueuedAt),
+		launchAcknowledgedAt: trimText(state.launchAcknowledgedAt),
+		relaunchRequested:
+			typeof state.relaunchRequested === "boolean"
+				? state.relaunchRequested
+				: cycleLaunchState !== "acknowledged" || Boolean(trimText(state.nextCycleAt)),
+		compactionRequested: Boolean(state.compactionRequested),
+		recoveryCount: Number.isFinite(state.recoveryCount) && state.recoveryCount >= 0 ? state.recoveryCount : 0,
 		goalSatisfied: Boolean(state.goalSatisfied),
 		completionSummary: trimText(state.completionSummary),
 		currentItemId: currentId,
@@ -732,6 +846,7 @@ export function migrateLoopState(state) {
 	};
 
 	assertValidMode(nextState.mode);
+	assertValidCycleLaunchState(nextState.cycleLaunchState);
 	if (!PAUSED_OR_TERMINAL_PHASES.has(nextState.phase) && nextState.phase !== "committing" && nextState.phase !== "relaunching") {
 		nextState.phase = derivePhase(nextState.backlog, nextState.currentItemId, nextState.phase);
 	}
@@ -800,6 +915,12 @@ export function formatLoopStateMarkdown(state) {
 - Last cycle summary: ${state.lastCycleSummary || "none"}
 - Last cycle changed files: ${state.lastCycleChangedFiles?.length ? state.lastCycleChangedFiles.join(", ") : "none"}
 - Last cycle noop: ${state.lastCycleNoop ? "yes" : "no"}
+- Cycle launch state: ${state.cycleLaunchState || "unknown"}
+- Launch queued at: ${state.launchQueuedAt || "none"}
+- Launch acknowledged at: ${state.launchAcknowledgedAt || "none"}
+- Relaunch requested: ${state.relaunchRequested ? "yes" : "no"}
+- Compaction requested: ${state.compactionRequested ? "yes" : "no"}
+- Recovery count: ${Number.isFinite(state.recoveryCount) ? state.recoveryCount : 0}
 - Next cycle retry: ${state.nextCycleAt || "none"}
 - Goal satisfied in current cycle: ${state.goalSatisfied ? "yes" : "no"}
 - Completion summary: ${state.completionSummary || "none"}
@@ -857,6 +978,12 @@ Current item: ${state.currentItemId || "none"}
 Last cycle commit: ${state.lastCycleCommitSha || "none"}
 Last cycle summary: ${state.lastCycleSummary || "none"}
 Last cycle noop: ${state.lastCycleNoop ? "yes" : "no"}
+Cycle launch state: ${state.cycleLaunchState || "unknown"}
+Launch queued at: ${state.launchQueuedAt || "none"}
+Launch acknowledged at: ${state.launchAcknowledgedAt || "none"}
+Relaunch requested: ${state.relaunchRequested ? "yes" : "no"}
+Compaction requested: ${state.compactionRequested ? "yes" : "no"}
+Recovery count: ${Number.isFinite(state.recoveryCount) ? state.recoveryCount : 0}
 Next cycle retry: ${state.nextCycleAt || "none"}
 
 Recent AutoDevelop commits:

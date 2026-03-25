@@ -1,10 +1,11 @@
-export const LOOP_STATE_VERSION = 5;
+export const LOOP_STATE_VERSION = 6;
 
 export const BACKLOG_KINDS = ["research", "code", "test"];
 export const ITEM_STATUSES = ["pending", "in_progress", "done", "blocked"];
 
 export const LOOP_MODES = ["cycle"];
 export const LOOP_PHASES = ["planning", "researching", "implementing", "testing", "committing", "relaunching", "paused", "blocked", "stopped"];
+export const CYCLE_LAUNCH_STATES = ["not_started", "queued", "acknowledged"];
 export const LEGACY_LOOP_PHASES = new Set(["improving", "complete", "verifying", "reviewing"]);
 
 export const ACTIVE_PHASES = new Set(["planning", "researching", "implementing", "testing", "committing", "relaunching"]);
